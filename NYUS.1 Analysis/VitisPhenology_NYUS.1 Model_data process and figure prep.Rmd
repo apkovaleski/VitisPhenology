@@ -1,0 +1,2139 @@
+---
+title: "VitisPhenology data processing and figure preparation"
+author: "Al Kovaleski"
+date: "12/19/2025"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+
+# Data processing
+
+```{r Load libraries and data}
+
+library(rstudioapi)
+library(progressr)
+library(ggplot2)
+library(ggbeeswarm)
+library(data.table)
+library(purrr)
+library(dplyr)
+library(tidyr)
+library(chillR)
+library(lubridate)
+library(multcomp)
+library(emmeans)
+library(multcompView)
+library(patchwork)
+handlers("txtprogressbar")
+
+# set working directory to source file location
+setwd(dirname(getActiveDocumentContext()$path)) 
+
+# load functions
+source("VitisPhenology_functions.r")
+
+# load data
+
+# temperature data
+wdat <- read.csv("VitisPhenology_data_weather.csv", stringsAsFactors = T)
+# location data (with latitudes for hourly and chill calculations)
+ldat <- read.csv("VitisPhenology_data_locations.csv", stringsAsFactors = T)
+# budbreak data
+bbdat <- read.csv("VitisPhenology_data_budbreak.csv", stringsAsFactors = T)
+
+```
+
+```{r Visualize temperature data}
+
+wdat <- wdat |> 
+  mutate(Date = as.Date(paste(Year, Month, Day, sep="-"), format = "%Y-%m-%d")) |> 
+  left_join(ldat |> dplyr::select(Location, Location2, Country, Latitude), 
+            by = c("Location", "Location2", "Country"))
+
+wdat %>%
+  group_by(Location, Year) %>%
+  dplyr::summarise(
+    mean_Tmax = mean(Tmax, na.rm = TRUE),
+    mean_Tmin = mean(Tmin, na.rm = TRUE)) |> 
+  ungroup() |> 
+  ggplot() +
+  geom_smooth(aes(Year, mean_Tmax),alpha=0.7, method = "lm", se = FALSE, color = "red") +
+  geom_line(aes(Year, mean_Tmax), linewidth=1, color="darkred") +
+  geom_smooth(aes(Year, mean_Tmin), alpha=0.7, method = "lm", se = FALSE, color = "blue") +
+  geom_line(aes(Year, mean_Tmin), linewidth=1, color="darkblue") +
+  labs(x="", y="Annual mean Tmax (red) and Tmin (blue)") +
+  facet_wrap(~ Location, ncol = 4) +
+  theme_bw()
+
+wdat %>%
+  pivot_longer(cols = c(Tmax, Tmin),
+               names_to = "PlotVar",
+               values_to = "Temperature") |> 
+  group_by(Location) %>%
+  mutate(Loc_order = mean(Temperature, na.rm = TRUE),
+         PlotVar = factor(PlotVar, levels = c("Tmin", "Tmax"))) |> 
+  ungroup() |> 
+  mutate(Location = forcats::fct_reorder(Location, Loc_order)) |> 
+  ggplot(aes(x = Temperature, y = Location, fill = Location)) +
+  ggridges::geom_density_ridges(scale = 1,
+                                quantile_lines = TRUE,
+                                quantiles = 2) +
+  facet_wrap(~ PlotVar, ncol = 2) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+```
+
+
+
+```{r [1] daily -> hourly | [2] calculate chill | [3] reduce to daily again}
+
+# Chill calculation for all location x year combinations
+wdat_chill <- VitisPhenology_compute_chill(wdat, keep_hourly = F)
+
+
+wdat_chill <- wdat_chill |>
+  rename(MinC = Tmin,
+         MaxC = Tmax)
+
+wdat_chill_keep <- wdat_chill
+
+
+```
+
+
+
+```{r Set up parameter table}
+
+parms <- tribble(
+  ~Cultivar,                 ~tliml, ~tlimh, ~tlimb, ~tlime, ~m,  ~n,  ~b,    ~c,  ~kdeacc_parm, ~a,  ~slp, ~int,
+  "Concord",                 0,      12,     8,      66,     31,  6,  -2.1,  24,  1.9,          3.5, 3,    5,
+  "Concord_10",              0,      10,     11,     66,     28,  6,  -2.3,  24,  1.9,          3.5, 3,    4,
+  "Concord_90",              0,      12,     8,      66,     33,  6,  -2.2,  24,  1.9,          4.0, 2,    4,
+  "Cabernet_Sauvignon",      0,      8,      7,      66,     23,  6,  -2.2,  22,  1.8,          5.0, 6,    3,
+  "Cabernet_Sauvignon_10",   0,      6,      6,      66,     22,  6,  -1.7,  14,  1.7,          4.0, 7,    3,
+  "Cabernet_Sauvignon_90",   0,      10,     6,      66,     25,  6,  -1.9,  24,  1.7,          5.0, 4,    3,
+  "Riesling",                0,      12,     7,      66,     26,  6,  -1.9,  24,  2.2,          5.0, 3,    4,
+  "Riesling_10",             0,      10,     6,      66,     24,  6,  -2.0,  14,  2.2,          5.0, 3,    5,
+  "Riesling_90",             0,      14,     10,     66,     29,  6,  -1.9,  24,  2.0,          5.0, 2,    5
+)
+
+```
+
+
+
+```{r Run predictions}
+
+# Cold hardiness is predicted for each cultivar at the 50th, 10th and 90th percentiles
+prediction_levels <- parms$Cultivar
+preds <- NULL
+
+{start <- Sys.time()
+  for (i in prediction_levels) {
+
+
+    print(paste("Calculating predictions for",i,":"))
+
+    preds <- VitisPhenology_run_predictions(output=preds,
+                                            input=wdat_chill,
+                                            parameters=parms,
+                                            groups=i)
+    }
+  end <- Sys.time()
+}
+
+end-start
+
+preds_keep <- preds
+
+```
+
+
+
+```{r changes to "preds" to represent damage}
+
+# Calculating damage levels from predicted cold hardiness differences from daily minimum temperatures
+
+preds2 <- preds |>
+  mutate(
+    damlevel = case_when(
+      Cultivar %in% c("Concord_90", "Riesling_90", "Cabernet_Sauvignon_90") ~ 90,
+      Cultivar %in% c("Concord", "Riesling", "Cabernet_Sauvignon") ~ 50,
+      TRUE ~ 10),
+    Cultivar = case_when(
+      Cultivar %in% c("Concord_10", "Concord_90") ~ "Concord",
+      Cultivar %in% c("Riesling_10", "Riesling_90") ~ "Riesling",
+      Cultivar %in% c("Cabernet_Sauvignon_10", "Cabernet_Sauvignon_90") ~ "Cabernet_Sauvignon",
+      TRUE ~ Cultivar))
+
+
+preds2 <- preds2 |>
+  dplyr::select(Date, Location, Dataset, MinC, MaxC, JDay, Portions, CH, Cultivar, damlevel)
+
+
+preds3 <- preds2 |>
+  mutate(damlevel = paste0("CH", damlevel)) |>
+  pivot_wider(names_from = damlevel,
+              values_from = CH) |>
+  mutate(LocDatCult = as.factor(paste(Location, Dataset, Cultivar)),
+         damage = 0,
+         CH10r = pmin(CH10, -0.82),
+         CH50r = pmin(CH50, -1.2),
+         CH90r = pmin(CH90, -1.6)) 
+
+# Convert to data.table
+setDT(preds3)
+
+preds4 <- preds3[, damage := {
+
+  # Local copies of columns
+  CH10vect <- CH10r
+  CH50vect <- CH50r
+  CH90vect <- CH90r
+  MinCvect <- MinC
+
+  # Initialize damage vector
+  dmg <- rep(NA_real_, .N)
+
+  # Rule 1: CH10r > MinC & MinC < 0
+  idx1 <- which(!is.na(CH10vect) & !is.na(CH50vect) & !is.na(MinCvect) & CH10vect > MinCvect & MinCvect < 0)
+  dmg[idx1] <- ((50 - 10) / (CH50vect[idx1] - CH10vect[idx1])) * (MinCvect[idx1] - CH10vect[idx1]) + 10
+  # Rule 2: CH50r > MinC & MinC < 0
+  idx2 <- which(!is.na(CH50vect) & !is.na(CH90vect) & !is.na(MinCvect) & CH50vect > MinCvect & MinCvect < 0)
+  dmg[idx2] <- ((90 - 50) / (CH90vect[idx2] - CH50vect[idx2])) * (MinCvect[idx2] - CH50vect[idx2]) + 50
+  # Rule 3: CH90r > MinC & MinC < 0
+  idx3 <- which(!is.na(CH90vect) & !is.na(MinCvect) & CH90vect > MinCvect & MinCvect < 0)
+  dmg[idx3] <- 90
+
+  # Monotonic non-decreasing within LocDatCult
+  damage <- cummax(replace(dmg, is.na(dmg), 0))
+
+}, by = LocDatCult]
+
+
+preds4 <- preds4 |>
+  mutate(
+    # New10: base case
+    New10 = CH10 + ((CH50 - CH10) / 40) * (((100 - damage) * 0.1 + damage) - 10),
+    New10 = if_else(damage > 50,
+                    CH10 + ((CH90 - CH10) / 80) * (((100 - damage) * 0.1 + damage) - 10),
+                    New10),
+
+    # New50 and New90
+    New50 = CH50 + ((CH90 - CH50) / 40) * (((100 - damage) * 0.5 + damage) - 50),
+    New90 = CH90 + ((CH90 - CH50) / 40) * (((100 - damage) * 0.9 + damage) - 90),
+
+    # Threshold-adjusted versions
+    New10r = pmin(New10, -0.82),
+    New50r = pmin(New50, -1.2),
+    New90r = pmin(New90, -1.6),
+
+    # Intermediate CH values for interpolation
+    CH20r = CH10r + ((CH50r - CH10r) / 40) * 10,
+    CH30r = CH10r + ((CH50r - CH10r) / 40) * 20,
+    CH40r = CH10r + ((CH50r - CH10r) / 40) * 30,
+
+    CH60r = CH50r + ((CH90r - CH50r) / 40) * 10,
+    CH70r = CH50r + ((CH90r - CH50r) / 40) * 20,
+    CH80r = CH50r + ((CH90r - CH50r) / 40) * 30)
+
+
+
+# Modify budbreak data
+bbdat2 <- bbdat |>
+  filter(!(Location == "Vassal" & Dataset == "1974-1975")) # 1974-1975 season budbreak observations in Vassal removed as there is an unreasonable difference of 23 days between Riesling and Cab.-Sauvignon budbreak
+
+# Prepare budbreak data for predictions
+bbdatpred <- bbdat2 |>   
+  dplyr::select(Cultivar, Location, BBCH.scale, Observer, Dataset)
+
+preds5 <- full_join(preds4, bbdatpred, by = c("Cultivar", "Location", "Dataset")) |> 
+  mutate(BBCH.scale = replace_na(BBCH.scale, 7),
+         Observer   = replace_na(Observer, "No_record"))
+
+# Setting thresholds depending on cultivar and BBCH stage (and Observer for Bordeaux data)
+
+preds6 <- preds5 |>
+  mutate(
+    threshold1 = case_when(
+      Observer == "Bordenave"  ~ 0,
+      Cultivar == "Concord"    ~ 5,
+      BBCH.scale == 5          ~ 5,
+      TRUE                     ~ 10),
+    threshold2 = case_when(
+      Cultivar == "Concord"    ~ 5,
+      TRUE                     ~ 10))
+
+
+# Extracting predictions of budbreak based on cold hardiness thresholds
+
+preds6$ThreshDiff=preds6$New50-preds6$threshold1
+
+BBpreds <- preds6 %>%
+  group_by(LocDatCult) %>%
+  dplyr::summarise(
+
+    Location   = unique(Location),
+    Dataset    = unique(Dataset),
+    Cultivar   = as.factor(unique(Cultivar)),
+
+    # Original thresholds
+    BB10     = as.numeric(JDay[which.min(abs(CH10 - threshold1))]),
+    BB50     = as.numeric(JDay[which.min(abs(CH50 - threshold1))]),
+    BB90     = as.numeric(JDay[which.min(abs(CH90 - threshold1))]),
+
+    # Corrected thresholds
+    BB10Cor  = as.numeric(JDay[which.min(abs(New10 - threshold1))]),
+    BB50Cor  = as.numeric(JDay[which.min(abs(New50 - threshold1))]),
+    BB90Cor  = as.numeric(JDay[which.min(abs(New90 - threshold1))]),
+    
+    
+    ThreshDiff = as.numeric(ThreshDiff[which.min(abs(New50 - threshold1))]),
+    
+
+    # Final thresholds
+    BB10Fin  = as.numeric(JDay[which.min(abs(New10 - threshold2))]),
+    BB50Fin  = as.numeric(JDay[which.min(abs(New50 - threshold2))]),
+    BB90Fin  = as.numeric(JDay[which.min(abs(New90 - threshold2))]),
+
+    # Damage
+    damage.max   = max(damage, na.rm = TRUE),
+    damage.bb    = damage[which.min(abs(CH50 - threshold1))],
+
+    .groups = "drop")
+
+
+# Join budbreak data with budbreak predictions
+
+bbdat3 <- bbdat2 %>%
+  left_join(BBpreds, by = c("Cultivar", "Location", "Dataset")) %>%
+  mutate(damage.bin = if_else(damage.bb > 0, 1, 0))
+
+bbdat2b <- bbdat3
+
+# Stats checks 
+
+# 7.319433
+sqrt((sum((bbdat2b$bb.doy-(bbdat2b$BB50))^2))/length(bbdat2b$bb.doy)) #RMSE damaged
+# 7.169858
+sqrt((sum((bbdat2b$bb.doy-(bbdat2b$BB50Cor))^2))/length(bbdat2b$bb.doy)) #RMSE corrected
+
+#   Cultivar           RMSE_damaged RMSE_corrected
+#   <fct>                     <dbl>          <dbl>
+# 1 Cabernet_Sauvignon         7.57           7.27
+# 2 Concord                    5.38           6.14
+# 3 Riesling                   7.59           7.35
+bbdat2b %>%
+  group_by(Cultivar) %>%
+  summarise(
+    RMSE_damaged = sqrt(mean((bb.doy - BB50)^2, na.rm = TRUE)),
+    RMSE_corrected = sqrt(mean((bb.doy - BB50Cor)^2, na.rm = TRUE))
+  )
+
+
+### Calculation of RMSE for a null hypothesis, using an average date of budbreak for each cultivar, in each location ###
+
+test.bbdat2b <- bbdat2b %>%
+  group_by(Cultivar, Location) %>%
+  mutate(
+    mean.bb.doy = mean(bb.doy, na.rm = TRUE),
+    diff.mean.bb.doy = bb.doy - mean.bb.doy
+  ) %>%
+  ungroup()
+
+# RMSE based on a mean budbreak day of year for each cultivar in each location
+sqrt((sum((test.bbdat2b$bb.doy-(test.bbdat2b$mean.bb.doy))^2))/length(test.bbdat2b$bb.doy)) 
+# 9.451078
+
+```
+
+
+# Begin figure code
+
+
+```{r Figure 2. Conceptual}
+
+# data for Figure 2 (Portland 1983-1984")
+datFig2 <- preds6 |>
+  filter(LocDatCult == "Portland_NY 1983-1984 Concord") |>
+  mutate(Date = ymd(Date),
+         try = abs(CH50 - 5),
+         CH10store = CH10r,
+         CH90store = CH90r)
+datFig2_above_0 <- subset(datFig2, CH50 > -6 & CH10 > -6 & CH90 > -6)
+
+# Get the Date corresponding to the minimum 'try' value for use in the segment
+Fig2_segmentDate <- datFig2 |>
+  slice_min(order_by = try) |>
+  pull(Date)
+
+Figure2 <- ggplot() +
+  geom_ribbon(data = datFig2,
+              aes(x = Date, ymax = MaxC, ymin = MinC, group = Dataset),
+              lty = 1, color = "darkgrey", lwd = 0.1, alpha = 0.3) +
+  geom_abline(slope = 0, intercept = 0, size = 0.2, col = "black") +
+  geom_segment(aes(x = as.Date("1983-07-29"), y = 5, xend = as.Date("1984-07-14"), yend = 5), color = "#6A7845", size = 0.2, lty = 2) +
+  geom_segment(aes(x = Fig2_segmentDate, y = 5, xend = Fig2_segmentDate, yend = -35), color = "#6A7845", size = 0.2, lty = 2) +
+  geom_line(data = datFig2, 
+            aes(x = Date, y = CH50r), 
+            col = "#234F9C", size = 0.4, lty = 2) +
+  geom_line(data = datFig2_above_0,
+            aes(x = Date, y = CH50), 
+            col = "#D4492B",  size = 0.4, lty = 2) +
+  geom_ribbon(data = datFig2,
+              aes(x = Date, ymax = CH10r, ymin = CH90r), 
+              fill = "#234F9C", lty = 3, alpha = 0.1, lwd = 0.2, size = 0.5) +
+  geom_ribbon(data = datFig2,
+              aes(x = Date, ymax = CH10, ymin = CH90), 
+              fill = "#D4492B", col = "#D4492B", lty = 3, alpha = 0.1, lwd = 0.3, size = 0.4) +
+  geom_ribbon(data = datFig2,
+              aes(x = Date, ymax = CH10r, ymin = CH90r, group = as.factor(damage)), 
+              fill = "#234F9C", col = "#234F9C", lty = 1, alpha = 0.2, lwd = 0.3, size = 0.4, ) +
+  geom_point(aes(x = Fig2_segmentDate, y = 5), color = "#6A7845", size = 0.8) +
+  scale_y_continuous(limits = c(-35, 35), breaks = c(-30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30),
+                     labels = c(-30, "", -20, "", -10, "", 0, "", 10, "", 20, "", 30), expand = c(0, 0)) +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  labs(x="", y="") +
+  facet_wrap(.~Dataset, scales = "free_x") +
+  theme_bw(base_size = 6) +
+  theme(legend.position = "none",
+        strip.background = element_blank(),
+        strip.text = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x = element_line(size = 0.1, color = "black"),
+        axis.line.y = element_line(size = 0.1, color = "black"),
+        axis.text = element_text(size = 6, color = "black"),
+        axis.ticks = element_line(size = 0.1, color = "black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(color = c("black"), angle = 0, vjust = 0, hjust = 0.5)) +
+  coord_cartesian(xlim = c(as.Date("1983-08-15"), as.Date("1984-07-01")), ylim = c(-35, 35), expand = TRUE, default = FALSE, clip = "on")
+
+
+Figure2
+
+# ggsave(plot=Figure2,
+#        filename=paste0(format(Sys.time(), "%y%m%d_%I%M"),"Figure2.pdf"),
+#        width=3.5,
+#        height=2.5,
+#        units ="in",
+#        dpi=300,
+#        path="~/Desktop/VitisPhenology_exports/")
+
+```
+
+
+
+```{r Figure 3. Comparison of observations with predictions}
+
+
+bbdat2c=subset(bbdat2b, damage.bb>0)
+
+bbdat2d=subset(bbdat2b, damage.bb<1)
+
+bbdat2b$Error=bbdat2b$BB50-bbdat2b$bb.doy
+bbdat2b$ErrorCor=bbdat2b$BB50Cor-bbdat2b$bb.doy
+
+uncorr.bias <- mean(bbdat2b$Error)
+corr.bias <- mean(bbdat2b$ErrorCor)
+
+## Max CH each Dataset each location ##
+
+MaxCH  <- aggregate(CH50r~Dataset+Cultivar+Location, preds6, min)
+
+## Max chilling each year each location ##
+MaxChill <- aggregate(Portions~Dataset+Cultivar+Location, preds6, max)
+
+
+## dataset with bbpreds, also Max CH each yearr (50%) and Max chilling accumulated ##
+bbdat5 <- merge(bbdat2b, MaxCH)
+bbdat6 <- merge(bbdat5, MaxChill)
+
+# error structure based on min airT
+MinT <- aggregate(MinC~Dataset+Cultivar+Location, preds6, min)
+
+bbdat7 <- merge(bbdat6, MinT)
+
+# error structure based on average winter temps
+preds.winter <- data.frame(preds)
+preds.winter$month <- month(preds.winter$Date)
+preds.winter$day <- day(preds.winter$Date)
+preds.winter <- subset(preds.winter, month %in% c("12","01","02","03"))
+preds.winter$MeanC <- ((preds.winter$MinC + preds.winter$MaxC)/2)
+
+MeanT <- aggregate(MeanC~Dataset+Cultivar+Location, preds.winter, mean)
+
+bbdat8 <- merge(bbdat7, MeanT)
+
+
+bbdat8$Cor.value <- (bbdat8$BB50 - bbdat8$BB50Cor)
+
+bbdat8 <- bbdat8 %>%
+  mutate(
+    Cor.value = BB50 - BB50Cor,  # Calculate Cor.value
+    Cor.response = ifelse(Cor.value == 0, "no", "yes")  # Create Cor.response based on Cor.value
+  )
+
+pal2=c( "#C32966","#234F9C", "#3B8441")
+
+### Part A ####
+
+# Predictions + Observations Raw BB data
+All.Raw <- ggplot(data=bbdat8)+
+  geom_abline(slope=1,intercept = 0, lty=1, linewidth=0.3)+
+  geom_abline(slope=1,intercept = 10, lty=3, linewidth=0.3)+
+  geom_abline(slope=1,intercept = -10, lty=3, linewidth=0.3)+
+  # geom_smooth(aes(x=bb.doy,y=BB50, color=Cultivar,fill=Cultivar),method="lm", se=F, fullrange=T)+
+  geom_smooth(aes(x=bb.doy,y=BB50),method="lm", se=F, fullrange=T, color="black", size=0.7)+
+  # geom_point(aes(x=bb.doy,y=BB50, color=Cultivar), alpha=0.6, size=0.8)+
+  geom_point(aes(x=bb.doy,y=BB50, color=as.factor(damage.bin)), alpha=0.6, size=0.8)+
+  # scale_color_manual(values=pal2)+
+  # scale_fill_manual(values=pal2)+
+  # scale_color_manual(values = c("0" = "#335F60", "1" = "#F2B7B5"))+
+  scale_color_manual(values = c("0" = "#5F9ED0", "1" = "#C95300"))+
+  scale_y_continuous(limits=c(50,152), breaks=seq(50,150,10))+
+  scale_x_continuous(limits=c(50,152), breaks=seq(50,150,10))+
+  ylab("Predicted (DOY)") + xlab("Observed (DOY)") + labs(color="Cultivar", fill="Cultivar")+
+  theme_bw(base_size=6) +
+  # facet_wrap(.~Location)+
+  theme(legend.position = "none",
+        strip.background = element_rect(color="#CCCCCC"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x = element_line(linewidth=0.1,color="black"),
+        axis.line.y = element_line(linewidth=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(linewidth=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(angle=45,vjust=0.5, hjust=0.5),
+        aspect.ratio = 1)
+
+All.Raw
+
+
+
+
+bbdat8$Cultivar <- factor(bbdat8$Cultivar, levels = c("Cabernet_Sauvignon", "Riesling", "Concord"))
+
+pal2=c( "#C32966", "#3B8441","#234F9C")
+
+Cultivar.Raw <- ggplot(data=bbdat8)+
+  geom_abline(slope=1,intercept = 0, lty=1, linewidth=0.3)+
+  geom_abline(slope=1,intercept = 10, lty=3, linewidth=0.3)+
+  geom_abline(slope=1,intercept = -10, lty=3, linewidth=0.3)+
+  # geom_smooth(aes(x=bb.doy,y=BB50, color=Cultivar,fill=Cultivar),method="lm", size=0.5, se=T)+
+  geom_point(aes(x=bb.doy,y=BB50, color=Cultivar, alpha=.1), size=0.6)+
+  scale_color_manual(values=pal2)+
+  scale_fill_manual(values=pal2)+
+  # scale_y_continuous(limits=c(40,160), breaks=seq(40,160,40))+
+  scale_y_continuous(limits=c(50,152), breaks=seq(50,150,20))+
+  scale_x_continuous(limits=c(50,152), breaks=seq(50,150,20))+
+  ylab("Predicted (DOY)") + xlab("Observed (DOY)") + labs(color="Cultivar", fill="Cultivar")+
+  theme_bw(base_size=6) +
+  # facet_wrap(.~Cultivar, ncol=1, scales="free")+
+  facet_wrap(.~Cultivar, ncol=1)+
+  theme(legend.position = "none",
+        # strip.background = element_rect(color="#CCCCCC"),
+        strip.background = element_blank(),
+        strip.text = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x = element_line(linewidth=0.1,color="black"),
+        axis.line.y = element_line(linewidth=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(linewidth=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(angle=45,vjust=0.5, hjust=0.5),
+        aspect.ratio = 1)
+
+Cultivar.Raw
+
+
+
+# Calculate metrics for each cultivar
+
+
+metrics <- bbdat8 %>%
+  group_by(Cultivar) %>%
+  summarise(
+    n = length(bb.doy),
+    RMSE = sqrt(mean((bb.doy - BB50)^2, na.rm = TRUE)),
+    Bias = mean(BB50 - bb.doy, na.rm = TRUE),
+    R2 = cor(BB50, bb.doy, use = "complete.obs")^2
+  ) %>%
+  ungroup() %>%
+  mutate(
+    RMSE = round(RMSE, 1),
+    Bias = round(Bias, 1),
+    R2   = round(R2, 1)
+  )
+
+print(metrics)
+
+
+
+# Merge metrics with bbdat8 for annotation
+bbdat8 <- bbdat8 %>%
+  left_join(metrics, by = "Cultivar")
+
+# Updated plot with annotations
+Cultivar.Raw <- ggplot(data=bbdat8)+
+  geom_abline(slope=1, intercept=0, lty=1, linewidth=0.3)+
+  geom_abline(slope=1, intercept=10, lty=3, linewidth=0.3)+
+  geom_abline(slope=1, intercept=-10, lty=3, linewidth=0.3)+
+  geom_point(aes(x=bb.doy, y=BB50, color=Cultivar, alpha=.1), size=0.6)+
+  scale_color_manual(values=pal2)+
+  scale_fill_manual(values=pal2)+
+  scale_y_continuous(limits=c(50,152), breaks=seq(50,150,20))+
+  scale_x_continuous(limits=c(50,152), breaks=seq(50,150,20))+
+  ylab("Predicted (DOY)") + xlab("Observed (DOY)") + labs(color="Cultivar", fill="Cultivar")+
+  theme_bw(base_size=6) +
+  facet_wrap(.~Cultivar, ncol=1)+
+  theme(
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    panel.grid = element_blank(),
+    panel.border = element_blank(),
+    axis.line.x = element_line(linewidth=0.1, color="black"),
+    axis.line.y = element_line(linewidth=0.1, color="black"),
+    axis.text = element_text(size=6, color="black"),
+    axis.ticks = element_line(linewidth=0.1, color="black"),
+    axis.ticks.length = unit(0.2, 'lines'),
+    axis.text.x = element_text(angle=45, vjust=0.5, hjust=0.5),
+    aspect.ratio = 1
+  ) +
+  # Add annotations for metrics
+  geom_text(data=metrics, aes(x=75, y=150, 
+                              label=paste0("n=", n, "\nRMSE=", round(RMSE, 2), "\nBias=", round(Bias, 2), "\nR2=", round(R2, 2))),
+            size=2, hjust=0)
+
+# Calculate metrics for each cultivar
+metrics <- bbdat8 %>%
+  group_by(Cultivar) %>%
+  summarise(
+    n = n(),  # Sample size
+    RMSE = sqrt(mean((bb.doy - BB50)^2)),  # Root Mean Square Error
+    Bias = mean(BB50 - bb.doy),  # Bias
+    R2 = cor(BB50, bb.doy)^2  # R-squared
+  )
+
+# Add annotations for the metrics to the plot
+Cultivar.Raw <- ggplot(data=bbdat8)+
+  geom_abline(slope=1, intercept=0, lty=1, linewidth=0.3)+
+  geom_abline(slope=1, intercept=10, lty=3, linewidth=0.3)+
+  geom_abline(slope=1, intercept=-10, lty=3, linewidth=0.3)+
+  geom_point(aes(x=bb.doy, y=BB50, color=Cultivar, alpha=.1), size=0.6)+
+  scale_color_manual(values=pal2)+
+  scale_fill_manual(values=pal2)+
+  scale_y_continuous(limits=c(50,152), breaks=seq(50,150,20))+
+  scale_x_continuous(limits=c(50,152), breaks=seq(50,150,20))+
+  ylab("Predicted (DOY)") + xlab("Observed (DOY)") + labs(color="Cultivar", fill="Cultivar")+
+  theme_bw(base_size=6) +
+  facet_wrap(.~Cultivar, ncol=1)+
+  theme(
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    panel.grid = element_blank(),
+    panel.border = element_blank(),
+    axis.line.x = element_line(linewidth=0.1, color="black"),
+    axis.line.y = element_line(linewidth=0.1, color="black"),
+    axis.text = element_text(size=6, color="black"),
+    axis.ticks = element_line(linewidth=0.1, color="black"),
+    axis.ticks.length = unit(0.2, 'lines'),
+    axis.text.x = element_text(angle=45, vjust=0.5, hjust=0.5),
+    aspect.ratio = 1
+  ) +
+  # Add annotations for n, RMSE, Bias, and R2
+  geom_text(data=metrics, aes(x=75, y=150,
+                              label=paste0("n=", n, "\nRMSE=", round(RMSE, 1), "\nBias=", round(Bias, 1), "\nR2=", round(R2, 1))),
+            size=2, hjust=0)
+
+Cultivar.Raw
+
+
+### Part B ####
+
+# Portland 1976-1977" (included in Figure 3)
+portlandB <- preds6 |>
+  filter(LocDatCult == "Portland_NY 1976-1977 Concord") |>
+  mutate(Date = ymd(Date),
+         try = abs(CH50 - 5),
+         CH10store = CH10r,
+         CH90store = CH90r)
+
+# Get the Date corresponding to the minimum 'try' value
+portlandB |>
+  slice_min(order_by = try) |>
+  pull(Date)
+
+portlandB_above_0 <- subset(portlandB, CH50 > -6 & CH10 > -6 & CH90 > -6)
+
+
+Year.w.damage_1 <- ggplot() +
+  geom_ribbon(aes(x = Date, ymax = MaxC, ymin = MinC, group = Dataset), data = portlandB, lty = 1, color = "darkgrey", lwd = 0.1, alpha = 0.3) +
+  geom_abline(slope = 0, intercept = 0, size = 0.2, col = "black") +
+  geom_segment(aes(x = as.Date("1977-02-1"), y = 5, xend = as.Date("1977-05-20"), yend = 5), color = "#5F9ED0", size = 0.2, lty = 2) +
+  
+  geom_segment(aes(x = as.Date("1977-05-01"), y = 5, xend = as.Date("1977-05-01"), yend = -35), color = "#C95300", size = 0.2, lty = 2) +
+  
+  geom_segment(aes(x = as.Date("1977-05-07"), y = 5, xend = as.Date("1977-05-07"), yend = -35), color = "#898989", size = 0.2, lty = 2) +
+  
+  geom_line(aes(x = Date, y = New50), col = "#6A7845", data = portlandB, size = 0.5, lty = 1) +
+  
+  geom_line(aes(x = Date, y = CH50r), col = "#234F9C", data = portlandB, size = 0.5, lty = 1) +
+  geom_line(aes(x = Date, y = CH50), col = "#234F9C", data = portlandB, size = 0.4, lty = 2) +
+  
+  geom_ribbon(aes(x = Date, ymax = CH10r, ymin = CH90r), fill = "#234F9C", lty = 1, alpha = 0.1, lwd = 0.2, size = 0.2, data = portlandB) +
+  geom_ribbon(aes(x = Date, ymax = CH10, ymin = CH90), fill = "#6A7845", col = "#6A7845", lty = 1, alpha = 0.1, lwd = 0.2, size = 0.2, data = portlandB) +
+  geom_ribbon(aes(x = Date, ymax = CH10r, ymin = CH90r, group = as.factor(damage)), fill = "#234F9C", col = "#234F9C", lty = 1, alpha = 0.2, lwd = 0.2, size = 0.2, data = portlandB) +
+  geom_point(aes(x = as.Date("1977-05-01"), y = 5), color = "#C95300", size = 0.8) +
+  geom_point(aes(x = as.Date("1977-05-07"), y = 5), color = "#898989", size = 0.8) +
+  scale_y_continuous(limits = c(-35, 35), breaks = c(-30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30),
+                     labels = c(-30, "", -20, "", -10, "", 0, "", 10, "", 20, "", 30), expand = c(0, 0)) +
+  scale_x_date(date_labels = "%d-%b", date_breaks = "1 week") +
+  xlab("") +
+  ylab("Temperature (°C)") +
+  facet_wrap(.~Dataset, scales = "free_x") +
+  theme_bw(base_size = 6) +
+  theme(legend.position = "none",
+        strip.background = element_blank(),
+        strip.text = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x = element_line(size = 0.1, color = "black"),
+        axis.line.y = element_line(size = 0.1, color = "black"),
+        axis.text = element_text(size = 6, color = "black"),
+        axis.ticks = element_line(size = 0.1, color = "black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(color = c("black"), angle = 45, vjust = 0, hjust = 0.5)) +
+  coord_cartesian(xlim = c(as.Date("1977-03-15"), as.Date("1977-05-15")), ylim = c(-35, 35), expand = TRUE, default = FALSE, clip = "on")
+
+
+Year.w.damage_1
+
+
+
+
+
+### Part C ####
+
+
+bbdat2b$damage.bin <- as.factor(bbdat2b$damage.bin)
+bbdat2d$damage.bin <- as.factor(bbdat2d$damage.bin)
+bbdat2c$damage.bin <- as.factor(bbdat2c$damage.bin)
+
+bbdat2bb=bbdat2b[order(bbdat2b$damage.bin),]
+
+bbdat2d$error <- (bbdat2d$bb.doy - bbdat2d$BB50)
+
+bbdat2d <- bbdat2d %>%
+  filter(!(Location == "Vassal" & Dataset == "1974-1975"))
+
+bbdat2c <- bbdat2c %>%
+  mutate(damage.bin.2 = case_when(
+    damage.bin == "0" ~ "0",
+    damage.bin == "1" ~ "2",
+  ))
+
+bbdat2bb <- bbdat2bb %>%
+  mutate(damage.bin.2 = case_when(
+    damage.bin == "0" ~ "0",
+    damage.bin == "1" ~ "2",
+  ))
+
+
+Damage1 <- ggplot()+
+  
+  geom_ribbon(aes(x=c(-2,5),ymax=c(50,50),ymin=c(0,0)),lty=1, fill="#E5A272", lwd=0.1, alpha=0.15 )+
+  geom_ribbon(aes(x=c(-2,5),ymax=c(0,0),ymin=c(-40,-40)),lty=1, fill="#074783", lwd=0.1, alpha=0.15 )+
+  
+  geom_beeswarm(aes(y=((bbdat2bb$bb.doy-(bbdat2bb$BB50))*-1), x=-1, color=bbdat2bb$damage.bin), alpha=0.8, cex=0.5, size=0.6, shape="circle", method="square", corral="gutter")+
+  geom_beeswarm(aes(y=((bbdat2d$bb.doy-(bbdat2d$BB50))*-1), x=0, color=bbdat2d$damage.bin), alpha=0.8, cex=0.5, size=0.6,shape="circle", method="square", corral="gutter")+
+  geom_beeswarm(aes(y=((bbdat2c$bb.doy-(bbdat2c$BB50))*-1), x=1, color=bbdat2c$damage.bin), alpha=0.8, cex=0.5, size=0.6, shape="circle", method="square", corral="gutter")+
+  geom_beeswarm(aes(y=((bbdat2c$bb.doy-(bbdat2c$BB50Cor))*-1), x=2, color=bbdat2c$damage.bin.2), alpha=0.8, cex=0.5, size=0.6, shape="circle", method="square", corral="gutter")+
+  geom_beeswarm(aes(y=((bbdat2bb$bb.doy-(bbdat2bb$BB50Cor))*-1), x=3, color=bbdat2bb$damage.bin.2), alpha=0.8, cex=0.5, size=0.6, shape="circle", method="square", corral="gutter")+
+  
+  geom_hline(yintercept=0, linetype="dotted", color="#335F60", size=0.4)+
+  
+  geom_violin(aes(y=((bbdat2bb$bb.doy-(bbdat2bb$BB50))*-1), x=-1), scale="count", fill="#88B99900", draw_quantiles = c(0.25, 0.5, 0.75), trim=TRUE, adjust=0.8, lwd=0.4, col="#1F415E")+
+  geom_violin(aes(y=((bbdat2d$bb.doy-(bbdat2d$BB50))*-1), x=-0), scale="count", fill="#88B99900", draw_quantiles = c(0.25, 0.5, 0.75), trim=TRUE, adjust=0.8, lwd=0.4, col="#1F415E")+
+  geom_violin(aes(y=((bbdat2c$bb.doy-(bbdat2c$BB50))*-1), x=1), scale="count", fill="#88B99900", draw_quantiles = c(0.25, 0.5, 0.75), trim=TRUE, adjust=0.8, lwd=0.4, col="#1F415E")+
+  geom_violin(aes(y=((bbdat2c$bb.doy-(bbdat2c$BB50Cor))*-1), x=2), scale="count", fill="#88B99900", draw_quantiles = c(0.25, 0.5, 0.75), trim=TRUE, adjust=0.8, lwd=0.4, col="#1F415E")+
+  geom_violin(aes(y=((bbdat2bb$bb.doy-(bbdat2bb$BB50Cor))*-1), x=3), scale="count", fill="#88B99900", draw_quantiles = c(0.25, 0.5, 0.75), trim=TRUE, adjust=0.8, lwd=0.4, col="#1F415E")+
+  
+  geom_point(aes(y=((bbdat2b$bb.doy-(bbdat2b$BB50))*-1), x=-1), stat="summary", fun="mean", shape=4, size=0.6, stroke=1, col="#071856")+
+  geom_point(aes(y=((bbdat2d$bb.doy-(bbdat2d$BB50))*-1), x=0), stat="summary", fun="mean", shape=4, size=0.7, stroke=1, col="#071856")+
+  geom_point(aes(y=((bbdat2c$bb.doy-(bbdat2c$BB50))*-1), x=1), stat="summary", fun="mean", shape=4, size=0.8, stroke=1, col="#071856")+
+  geom_point(aes(y=((bbdat2c$bb.doy-(bbdat2c$BB50Cor))*-1), x=2), stat="summary", fun="mean", shape=4, size=0.9, stroke=1, col="#071856")+
+  geom_point(aes(y=((bbdat2b$bb.doy-(bbdat2b$BB50Cor))*-1), x=3), stat="summary", fun="mean", shape=4, size=1, stroke=1, col="#071856")+
+  
+  scale_y_continuous(breaks=c(-30,-20,-10,0,10,20,30))+
+  
+  scale_x_continuous(breaks=c(-1,0,1,2,3), 
+                     labels=c("No damage + \ndamage uncorrected\n","No damage\n\n","Damaged \nuncorrected\n",paste("Damaged \ncorrected\n"), "No damage + \ndamage-corrected\n")) +
+  
+  scale_color_manual(values = c("0" = "#5F9ED0", "1" = "#C95300", "2" ="#898989"))+
+  xlab("")+ylab("Residuals (d)")+
+  theme_bw(base_size=6) +
+  theme(legend.position = "none",
+        strip.text = element_blank(),
+        strip.background = element_rect(color="white", fill="white"),
+        panel.grid = element_blank(),
+        panel.border = element_rect(linewidth=0.3,color="black"),
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        axis.text = element_text(size=6, color="black"),
+        axis.text.x = element_text(color=c("black"), angle=0,vjust=0, hjust=0.5),
+        panel.spacing = unit(1, "lines"))+
+  coord_cartesian(xlim = c(-1.5, 3.5), ylim = c(-30, 45), expand = TRUE, default = FALSE, clip = "on")
+
+Damage1 
+
+
+
+
+# Function to calculate RMSE and Bias
+get_metrics <- function(data, pred_col, actual_col, group_name) {
+  residuals <- (data[[actual_col]] - data[[pred_col]]) * -1
+  rmse <- sqrt(mean(residuals^2, na.rm = TRUE))
+  bias <- mean(residuals, na.rm = TRUE)
+  data.frame(Group = group_name, RMSE = rmse, Bias = bias)
+}
+
+metrics_bb     <- get_metrics(bbdat2bb, "BB50", "bb.doy", "No damage + uncorrected")
+metrics_d      <- get_metrics(bbdat2d, "BB50", "bb.doy", "No damage only")
+metrics_c      <- get_metrics(bbdat2c, "BB50", "bb.doy", "Damaged uncorrected")
+metrics_c_cor  <- get_metrics(bbdat2c, "BB50Cor", "bb.doy", "Damaged corrected")
+metrics_bb_cor <- get_metrics(bbdat2bb, "BB50Cor", "bb.doy", "No damage + corrected")
+
+
+all_metrics <- bind_rows(metrics_bb, metrics_d, metrics_c, metrics_c_cor, metrics_bb_cor)
+print(all_metrics)
+
+print(
+  all_metrics %>%
+    mutate(
+      RMSE = round(RMSE, 1),
+      Bias = round(Bias, 1)
+    )
+)
+
+
+#### Stats ####
+
+summary(lm((bbdat2b$bb.doy-bbdat2b$BB50)~bbdat2b$damage.bin))
+summary(lm((bbdat2b$bb.doy-bbdat2b$BB50Cor)~bbdat2b$damage.bin))
+
+summary(lm(bbdat2b$ErrorCor~0+bbdat2b$damage.bin))
+
+
+nodmg=bbdat2d$bb.doy-(bbdat2d$BB50) #No damage
+nodmg=bbdat2b$bb.doy[bbdat2b$damage.bin==0]-(bbdat2b$BB50[bbdat2b$damage.bin==0])
+dmgunco=bbdat2c$bb.doy-(bbdat2c$BB50) #Damage uncorrected
+dmgcor=bbdat2c$bb.doy-(bbdat2c$BB50Cor) #Damage corrected
+
+
+firstcomp=data.frame(Error=nodmg, damage="nodmg")
+firstcomp=rbind(firstcomp, data.frame(Error=dmgunco, damage="dmgunco"))
+
+anova(lm(Error~damage, data=firstcomp))
+
+
+secondcomp=data.frame(Error=nodmg, damage="nodmg")
+secondcomp=rbind(secondcomp, data.frame(Error=dmgcor, damage="dmgcor"))
+
+summary(lm(Error~damage, data=secondcomp))
+
+
+thirdcomp=data.frame(Error=dmgunco, damage="dmgunco")
+thirdcomp=rbind(thirdcomp, data.frame(Error=dmgcor, damage="dmgcor"))
+
+summary(lm(Error~damage, data=thirdcomp))
+
+
+
+fourthcomp=data.frame(Error=dmgunco, damage="dmgunco")
+fourthcomp=rbind(fourthcomp, data.frame(Error=dmgcor, damage="dmgcor"))
+fourthcomp=rbind(fourthcomp, data.frame(Error=nodmg, damage="nodmg"))
+
+
+
+fourthcompmodel <- lm(Error~damage, data=fourthcomp)
+summary(fourthcompmodel)
+anova(fourthcompmodel)
+
+test.lm5 = emmeans(fourthcompmodel, "damage") 
+cld(test.lm5, Letters = "abcdefg", level = 0.05, adjust="tukey", decreasing=T)
+pairs(test.lm5, adjust = "tukey")
+
+
+
+### Part D ####
+
+pal2=c( "#C32966","#234F9C", "#3B8441", "black")
+
+# Predictions + Observations Corrected BB data
+All.Cor <- ggplot(data=bbdat8)+
+  geom_abline(slope=1,intercept = 0, lty=1, linewidth=0.3)+
+  geom_abline(slope=1,intercept = 10, lty=3, linewidth=0.3)+
+  geom_abline(slope=1,intercept = -10, lty=3, linewidth=0.3)+
+  geom_smooth(aes(x=bb.doy,y=BB50Cor),method="lm", se=F, fullrange=T, color="black", size=0.7)+
+  geom_point(data=subset(bbdat8, damage.bin == 0), aes(x=bb.doy, y=BB50Cor), alpha=0.3, size=0.8, color="#5F9ED0")+
+  geom_point(data=subset(bbdat8, damage.bin == 1), aes(x=bb.doy, y=BB50Cor), alpha=0.6, size=0.8, color="#898989")+
+geom_point(data=subset(bbdat8, damage.bin == 1), aes(x=bb.doy, y=BB50), alpha=0.6, size=0.4, color="#C95300", shape=21)+
+  geom_segment(data=subset(bbdat8, damage.bin == 1),
+             aes(x=bb.doy, y=BB50, 
+                 xend=bb.doy, yend=BB50Cor),
+             color="#898989", size=0.3, alpha=0.7)+
+  scale_y_continuous(limits=c(50,152), breaks=seq(50,150,10))+
+  scale_x_continuous(limits=c(50,152), breaks=seq(50,150,10))+
+  ylab("Predicted (DOY)") + xlab("Observed (DOY)") + labs(color="Cultivar", fill="Cultivar")+
+  theme_bw(base_size=6) +
+  theme(legend.position = "none",
+        strip.background = element_rect(color="#CCCCCC"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x = element_line(linewidth=0.1,color="black"),
+        axis.line.y = element_line(linewidth=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(linewidth=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(angle=45,vjust=0.5, hjust=0.5),
+        aspect.ratio = 1)
+  
+All.Cor
+
+
+
+
+Cultivar.Cor <- ggplot(data=bbdat8)+
+  geom_abline(slope=1,intercept = 0, lty=1, linewidth=0.3)+
+  geom_abline(slope=1,intercept = 10, lty=3, linewidth=0.3)+
+  geom_abline(slope=1,intercept = -10, lty=3, linewidth=0.3)+
+  geom_point(aes(x=bb.doy,y=BB50Cor, color=Cultivar, alpha=.1), size=0.6)+
+  scale_color_manual(values=pal2)+
+  scale_fill_manual(values=pal2)+
+  scale_y_continuous(limits=c(50,152), breaks=seq(50,150,20))+
+  scale_x_continuous(limits=c(50,152), breaks=seq(50,150,20))+
+  ylab("Predicted (DOY)") + xlab("Observed (DOY)") + labs(color="Cultivar", fill="Cultivar")+
+  theme_bw(base_size=6) +
+  facet_wrap(.~Cultivar, ncol=1, scales="free")+
+  theme(legend.position = "none",
+        strip.background = element_blank(),
+        strip.text = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x = element_line(linewidth=0.1,color="black"),
+        axis.line.y = element_line(linewidth=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(linewidth=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(angle=45,vjust=0.5, hjust=0.5),
+        aspect.ratio = 1)
+
+Cultivar.Cor
+
+
+
+# Calculate metrics for each cultivar after correction
+
+metricsCor <- bbdat8 %>%
+  # group_by(Cultivar) %>%
+  summarise(
+    n = length(bb.doy),
+    RMSE = sqrt(mean((bb.doy - BB50Cor)^2, na.rm = TRUE)),
+    Bias = mean(BB50Cor - bb.doy, na.rm = TRUE),
+    R2 = cor(BB50Cor, bb.doy, use = "complete.obs")^2
+  ) %>%
+  ungroup() %>%
+  mutate(
+    RMSE = round(RMSE, 1),
+    Bias = round(Bias, 1),
+    R2   = round(R2, 1)
+  )
+
+print(metricsCor)
+
+
+
+# Patchwork assembly to preview the plot
+
+# First row
+row1 <- (All.Raw + Cultivar.Raw + plot_layout(widths = c(2, 1))) | Year.w.damage_1
+# Second row
+row2 <- Damage1 + All.Cor + plot_layout(widths = c(1.5, 1))
+# Combine rows
+final_plot <- row1 / row2
+# Print plot
+final_plot
+
+
+# # Export individual plot for final figure version creation
+# All.Raw
+# {plot_name <- "All.Raw"
+# ggsave(plot=All.Raw,
+#        filename=paste0(format(Sys.time(), "%y%m%d_%I%M"),"Figure3_part1_", plot_name, ".pdf"),
+#        width=3.5,
+#        height=2.5,
+#        units ="in",
+#        dpi=300,
+#        path="~/Desktop/VitisPhenology_exports/")}
+# 
+# Cultivar.Raw
+# {plot_name <- "Cultivar.Raw"
+# ggsave(plot=Cultivar.Raw,
+#        filename=paste0(format(Sys.time(), "%y%m%d_%I%M"),"Figure3_part2_", plot_name, ".pdf"),
+#        width=1.5,
+#        height=2.5,
+#        units ="in",
+#        dpi=300,
+#        path="~/Desktop/VitisPhenology_exports/")}
+# 
+# Year.w.damage_1
+# {plot_name <- "Year.w.damage_1"
+# ggsave(plot=Year.w.damage_1,
+#        filename=paste0(format(Sys.time(), "%y%m%d_%I%M"),"Figure3_part3_", plot_name, ".pdf"),
+#        width=3.5,
+#        height=2.5,
+#        units ="in",
+#        dpi=300,
+#        path="~/Desktop/VitisPhenology_exports/")}
+# 
+# Damage1
+# {plot_name <- "Damage1"
+# ggsave(plot=Damage1,
+#        filename=paste0(format(Sys.time(), "%y%m%d_%I%M"),"Figure3_part4_", plot_name, ".pdf"),
+#        width=4.2,
+#        height=2.5,
+#        units ="in",
+#        dpi=300,
+#        path="~/Desktop/VitisPhenology_exports/")}
+# All.Cor
+# {plot_name <- "All.Cor"
+# ggsave(plot=All.Cor,
+#        filename=paste0(format(Sys.time(), "%y%m%d_%I%M"),"Figure3_part5_", plot_name, ".pdf"),
+#        width=3.5,
+#        height=2.5,
+#        units ="in",
+#        dpi=300,
+#        path="~/Desktop/VitisPhenology_exports/")}
+# 
+# Cultivar.Cor
+# {plot_name <- "Cultivar.Cor"
+# ggsave(plot=Cultivar.Cor,
+#        filename=paste0(format(Sys.time(), "%y%m%d_%I%M"),"Figure3_part6_", plot_name, ".pdf"),
+#        width=1.5,
+#        height=2.5,
+#        units ="in",
+#        dpi=300,
+#        path="~/Desktop/VitisPhenology_exports/")}
+
+
+
+
+```
+
+
+
+
+
+```{r Figure 4. Chilling}
+
+
+### Part A ####
+
+datport=NULL
+for (i in seq(-20,25,0.5)) {
+  
+  HourTemp=rep(i, 24*50)
+  port=max(Dynamic_Model(HourTemp))
+  
+  
+  datport=rbind(datport,c(i,port))
+  
+  
+}
+
+datport=data.frame(datport)
+
+colnames(datport)=c("Temperature","Portions")
+datport$Portions=datport$Portions/max(datport$Portions)
+
+
+chillsub=subset(subset(preds6, month(preds6$Date) %in% c(10,11,12,1,2,3) ), Location %in% c("Portland_NY", "Vassal"))
+
+chillsub=subset(subset(preds6, month(preds6$Date) %in% c(8,9,10,11,12,1,2,3,4,5,6,7) ), Location %in% c("Portland_NY", "Vassal"))
+
+chillsub=subset(subset(preds6, month(preds6$Date) %in% c(11, 12, 1, 2, 3, 4) ), Location %in% c("Portland_NY", "Vassal"))
+
+chillsub=subset(subset(preds6, month(preds6$Date) %in% c(9, 10, 11, 12, 1, 2, 3, 4, 5) ), Location %in% c("Portland_NY", "Vassal"))
+
+#dashed line is the new distribution, full line is the regular effect of chilling in the dynamic model.
+
+
+ChillRange <- ggplot()+
+  geom_density(aes(x=c(chillsub$MinC, chillsub$MaxC), fill=c(chillsub$Location,chillsub$Location),col=c(chillsub$Location,chillsub$Location)), alpha=0.2)+
+  geom_line(aes(x=datport$Temperature,y=datport$Portions/15), size=0.3, color="black")+
+  geom_line(aes(x=(datport$Temperature-2),y=datport$Portions/15), lty=2, size=0.3, color="#7BA93E")+
+  geom_line(aes(x=(datport$Temperature-6),y=datport$Portions/15), lty=3, size=0.3, color="#3A5CA3")+
+  scale_y_continuous(sec.axis = sec_axis(~ .*15, breaks=c(0,0.25,0.5,0.75,1), name="Relative contribution"))+
+  ylab("Density")+xlab("Temperature (°C)")+
+  labs(color="Location", fill="Location")+
+  scale_color_manual(values=c("#9FCFC2","#79624B") ,labels=c("Portland, NY, USA","Vassal, France"))+
+  scale_fill_manual(values=c("#9FCFC2","#79624B") ,labels=c("Portland, NY, USA","Vassal, France"))+
+  theme_bw(base_size=6) +
+  scale_x_continuous(limits=c(-40,40), breaks=seq(-30,40,10))+
+  # theme(legend.position = c(0.2,0.7),
+  theme(legend.position = "none",
+        legend.background = element_blank(),
+        strip.text = element_blank(),
+        strip.background = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_rect(linewidth=0.3,color="black"),
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        axis.text = element_text(size=6, color="black"),
+        # axis.ticks = element_line(size=0.15,color="black"),
+        # axis.ticks.length = unit(-0.3, 'lines'),
+        axis.text.x = element_text(color=c("black"), angle=0,vjust=0, hjust=0.5),
+        panel.spacing = unit(1, "lines"))+
+  coord_cartesian(xlim = c(-30, 40), expand = TRUE, default = FALSE, clip = "on")
+
+
+ChillRange
+
+# ggsave("ChillRange_v1.pdf", plot=ChillRange, width=3.5, height=2.5, units =c("in"), dpi=300, path="~/Desktop/VitisPhenology_exports/")
+
+
+
+### Part B ####
+
+
+RMSE_var=read.csv("VitisPhenology_data_Figure4 RMSE chilling variation.csv")
+
+
+RMSE_var <- RMSE_var %>%
+  filter(Damage %in% c(1))
+
+
+RMSE_var2 <- filter(RMSE_var, Delta_chilling < 0)
+RMSE_var3 <- filter(RMSE_var, Delta_chilling > 0)
+RMSE_var4 <- filter(RMSE_var, Delta_chilling == 0)
+
+RMSE_var_f <- ggplot() +
+  geom_line(data=RMSE_var, aes(x = (Delta_chilling), y = RMSE, group = Damage, color = as.factor(Damage)), size=1, alpha=0.7) +
+  geom_point(data=RMSE_var, aes(x = (Delta_chilling), y = RMSE, group = Damage, color = as.factor(Damage)), size=1.5, shape = 21, fill = "#8491B4FF", color = "white") +
+  geom_text(data=RMSE_var2, aes(x = (Delta_chilling), y = RMSE, label = round(RMSE, 1)), hjust = -0.3, vjust = 0.1, size = 1.5) +
+    geom_text(data=RMSE_var3, aes(x = (Delta_chilling), y = RMSE, label = round(RMSE, 1)), hjust = -0.2, vjust = 2, size = 1.5) +
+      geom_text(data=RMSE_var4, aes(x = (Delta_chilling), y = RMSE, label = round(RMSE, 1)), hjust = 0.5, vjust = -1.4, size = 1.5) +
+  labs(x = "Chilling (°C)",
+       y = "RMSE (days)") +
+  scale_color_manual(values=c("#8491B4FF", "#E64B35FF")) +
+  scale_y_log10(breaks=c(0,10,20,40,60,80,100)) +  # log scale transformation
+  scale_x_continuous(limits=c(-6,6), breaks=seq(-6,6,2)) +
+  theme_bw(base_size=6) +
+  theme(legend.position = "none",
+        strip.background = element_rect(color="#CCCCCC"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x = element_line(size=0.1,color="black"),
+        axis.line.y = element_line(size=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(size=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(color="black", angle=0, vjust=0.5, hjust=0.5))
+
+RMSE_var_f
+
+#ggsave("RMSE_var_v1.pdf", plot=RMSE_var_f, width=3.5, height=2.5, units =c("in"), dpi=300, path="~/Desktop/VitisPhenology_exports/")
+
+
+
+
+### Part C ####
+wdat2c <- wdat_chill |> 
+  mutate(Date = ymd(Date))
+portions <- subset(wdat2c, Location %in% c("Portland_NY", "Vassal"))
+
+portions <- subset(portions, Dataset %in% c("2001-2002"))
+
+start_date <- as.Date("2001-08-01")
+end_date <- as.Date("2002-07-31")
+date_sequence <- seq.Date(start_date, end_date, by = "day")
+
+# Create a data frame to map dates to consecutive day numbers
+date_mapping <- data.frame(Date = date_sequence, Day = 1:length(date_sequence))
+
+# Merge this mapping with the portions data frame
+portions <- left_join(portions, date_mapping, by = "Date")
+
+# Custom function to convert date to month initials
+
+date_to_month_initial <- function(date) {
+  month_initials <- c("Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul")
+  month_idx <- as.numeric(format(date, "%m")) - 7
+  if(month_idx <= 0) month_idx <- month_idx + 12
+  return(month_initials[month_idx])
+}
+
+# Apply the custom function to the breaks
+breaks <- c(1, 32, 62, 93, 123, 154, 184, 215, 246, 276, 307, 337)
+labels <- sapply(date_sequence[breaks], date_to_month_initial)
+
+
+# portions <- filter(portions, Portions > 0)
+Portions1 <- ggplot(data=portions)+
+  geom_line(aes(x=Day,y=Portions, color=Location), size=0.8, alpha=1)+
+  scale_color_manual(values = c("Portland_NY" = "#9FCFC2", "Vassal" = "#79624B"))+
+  ylab("Portions") + xlab("Month") + labs(color="Location")+
+  scale_x_continuous(limits = c(0, 365), breaks = breaks, labels = labels) +
+  # scale_x_continuous(limits=c(0,365),breaks=c(0,50,100, 150, 200, 250, 300, 350))+
+  scale_y_continuous(limits=c(0,150),breaks=c(0, 50, 100, 150))+
+  theme_bw(base_size=6) +
+  theme(legend.position = "none",
+        strip.background = element_rect(color="#CCCCCC"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x = element_line(linewidth=0.1,color="black"),
+        axis.line.y = element_line(linewidth=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(linewidth=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(angle=45,vjust=0.5, hjust=0.5),
+        axis.text.y = element_text(angle=0,vjust=0.5, hjust=0.5),
+        aspect.ratio = 1)
+
+Portions1
+
+# ggsave("Portions(Current_model).pdf", plot=Portions1, width=3.4, height=2.2, units =c("in"), dpi=300, path="~/Desktop/VitisPhenology_exports/")
+
+
+bbdat8sub=subset(subset(bbdat8, Location %in% c("Portland_NY", "Vassal")))
+
+bbdat8sub1=subset(subset(bbdat8, Location %in% c("Portland_NY")))
+bbdat8sub2=subset(subset(bbdat8, Location %in% c("Vassal")))
+
+
+Pred1 <- ggplot(data=bbdat8sub)+
+  geom_abline(slope=1,intercept = 0, lty=1, linewidth=0.3)+
+  geom_abline(slope=1,intercept = 10, lty=3, linewidth=0.3)+
+  geom_abline(slope=1,intercept = -10, lty=3, linewidth=0.3)+
+  geom_hline(yintercept = 150, linetype="dashed", color = "darkblue", size=0.3)+
+  # geom_smooth(aes(x=bb.doy,y=BB50, color=Cultivar,fill=Cultivar),method="lm", se=F, fullrange=T)+
+  geom_smooth(aes(x=bb.doy,y=BB50Cor, group=Location),method="lm", se=F, fullrange=F, size=0.5, color="black")+
+  # geom_point(aes(x=bb.doy,y=BB50, color=Cultivar), alpha=0.6, size=0.8)+
+  geom_point(aes(x=bb.doy,y=BB50Cor, color=Location), alpha=0.6, size=0.8)+
+  # scale_color_manual(values=pal2)+
+  # scale_fill_manual(values=pal2)+
+  scale_color_manual(values = c("Portland_NY" = "#9FCFC2", "Vassal" = "#79624B"))+
+  scale_y_continuous(limits=c(50,150), breaks=seq(50,150,10))+
+  scale_x_continuous(limits=c(50,150), breaks=seq(50,150,10))+
+  ylab("Predicted (DOY)") + xlab("Observed (DOY)") + labs(color="Cultivar", fill="Cultivar")+
+  theme_bw(base_size=6) +
+  # facet_wrap(.~Cultivar)+
+  theme(legend.position = "none",
+        strip.background = element_rect(color="#CCCCCC"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x = element_line(linewidth=0.1,color="black"),
+        axis.line.y = element_line(linewidth=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(linewidth=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(angle=45,vjust=0.5, hjust=0.5),
+        aspect.ratio = 1)
+
+Pred1
+
+# ggsave("Pred(Current_model).pdf", plot=Pred1, width=3.4, height=2.2, units =c("in"), dpi=300, path="~/Desktop/VitisPhenology_exports/")
+
+
+# 7.319433
+sqrt((sum((bbdat2b$bb.doy-(bbdat2b$BB50))^2))/length(bbdat2b$bb.doy)) #RMSE damaged
+# 7.169858
+sqrt((sum((bbdat2b$bb.doy-(bbdat2b$BB50Cor))^2))/length(bbdat2b$bb.doy)) #RMSE corrected
+
+
+bbdat8sub %>%
+  group_by(Location) %>%
+  summarise(
+    n = sum(
+      is.finite(bb.doy) &
+      is.finite(BB50) &
+      is.finite(BB50Cor)
+    ),
+    RMSE_damaged = sqrt(mean((bb.doy - BB50)^2, na.rm = TRUE)),
+    RMSE_corrected = sqrt(mean((bb.doy - BB50Cor)^2, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+
+
+### Part D ####
+
+wdat2c <- wdat_chill |> 
+  mutate(Date = ymd(Date))
+
+portions <- subset(wdat2c, Location %in% c("Portland_NY", "Vassal"))
+
+portions <- subset(portions, Dataset %in% c("2001-2002"))
+
+start_date <- as.Date("2001-08-01")
+end_date <- as.Date("2002-07-31")
+date_sequence <- seq.Date(start_date, end_date, by = "day")
+
+# Create a data frame to map dates to consecutive day numbers
+date_mapping <- data.frame(Date = date_sequence, Day = 1:length(date_sequence))
+
+# Merge this mapping with the portions data frame
+portions <- left_join(portions, date_mapping, by = "Date")
+
+# Custom function to convert date to month initials
+date_to_month_initial <- function(date) {
+  month_initials <- c("Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul")
+  month_idx <- as.numeric(format(date, "%m")) - 7
+  if(month_idx <= 0) month_idx <- month_idx + 12
+  return(month_initials[month_idx])
+}
+
+# Apply the custom function to the breaks
+breaks <- c(1, 32, 62, 93, 123, 154, 184, 215, 246, 276, 307, 337)
+labels <- sapply(date_sequence[breaks], date_to_month_initial)
+
+
+# portions <- filter(portions, Portions > 0)
+Portions1 <- ggplot(data=portions)+
+  geom_line(aes(x=Day,y=Portions, color=Location), size=0.8, alpha=1)+
+  scale_color_manual(values = c("Portland_NY" = "#9FCFC2", "Vassal" = "#79624B"))+
+  ylab("Portions") + xlab("Month") + labs(color="Location")+
+  scale_x_continuous(limits = c(0, 365), breaks = breaks, labels = labels) +
+  # scale_x_continuous(limits=c(0,365),breaks=c(0,50,100, 150, 200, 250, 300, 350))+
+  scale_y_continuous(limits=c(0,150),breaks=c(0, 50, 100, 150))+
+  theme_bw(base_size=6) +
+  theme(legend.position = "none",
+        strip.background = element_rect(color="#CCCCCC"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x = element_line(linewidth=0.1,color="black"),
+        axis.line.y = element_line(linewidth=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(linewidth=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(angle=45,vjust=0.5, hjust=0.5),
+        axis.text.y = element_text(angle=0,vjust=0.5, hjust=0.5),
+        aspect.ratio = 1)
+
+Portions1
+
+# ggsave("Portions(-2)_v2.pdf", plot=Portions1, width=3.4, height=2.2, units =c("in"), dpi=300, path="~/Desktop/VitisPhenology_exports/")
+
+
+bbdat8sub=subset(subset(bbdat8, Location %in% c("Portland_NY", "Vassal")))
+
+bbdat8sub1=subset(subset(bbdat8, Location %in% c("Portland_NY")))
+bbdat8sub2=subset(subset(bbdat8, Location %in% c("Vassal")))
+
+
+Pred1 <- ggplot(data=bbdat8sub)+
+  geom_abline(slope=1,intercept = 0, lty=1, linewidth=0.3)+
+  geom_abline(slope=1,intercept = 10, lty=3, linewidth=0.3)+
+  geom_abline(slope=1,intercept = -10, lty=3, linewidth=0.3)+
+  geom_hline(yintercept = 150, linetype="dashed", color = "darkblue", size=0.3)+
+  # geom_smooth(aes(x=bb.doy,y=BB50, color=Cultivar,fill=Cultivar),method="lm", se=F, fullrange=T)+
+  geom_smooth(aes(x=bb.doy,y=BB50Cor, group=Location),method="lm", se=F, fullrange=F, size=0.5, color="black")+
+  # geom_point(aes(x=bb.doy,y=BB50, color=Cultivar), alpha=0.6, size=0.8)+
+  geom_point(aes(x=bb.doy,y=BB50Cor, color=Location), alpha=0.6, size=0.8)+
+  # scale_color_manual(values=pal2)+
+  # scale_fill_manual(values=pal2)+
+  scale_color_manual(values = c("Portland_NY" = "#9FCFC2", "Vassal" = "#79624B"))+
+  scale_y_continuous(limits=c(50,190), breaks=seq(50,190,20))+
+  scale_x_continuous(limits=c(50,150), breaks=seq(50,150,10))+
+  ylab("Predicted (DOY)") + xlab("Observed (DOY)") + labs(color="Cultivar", fill="Cultivar")+
+  theme_bw(base_size=6) +
+  # facet_wrap(.~Cultivar)+
+  theme(legend.position = "none",
+        strip.background = element_rect(color="#CCCCCC"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x = element_line(linewidth=0.1,color="black"),
+        axis.line.y = element_line(linewidth=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(linewidth=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(angle=45,vjust=0.5, hjust=0.5),
+        aspect.ratio = 1)
+
+Pred1
+
+# ggsave("Pred(-2)_v3.pdf", plot=Pred1, width=3.4, height=2.2, units =c("in"), dpi=300, path="~/Desktop")
+
+# 16.3918
+sqrt((sum((bbdat2b$bb.doy-(bbdat2b$BB50))^2))/length(bbdat2b$bb.doy)) #RMSE damaged
+# 16.73472
+sqrt((sum((bbdat2b$bb.doy-(bbdat2b$BB50Cor))^2))/length(bbdat2b$bb.doy)) #RMSE corrected
+
+
+bbdat8sub %>%
+  group_by(Location) %>%
+  summarise(
+    n = sum(
+      is.finite(bb.doy) &
+      is.finite(BB50) &
+      is.finite(BB50Cor)
+    ),
+    RMSE_damaged = sqrt(mean((bb.doy - BB50)^2, na.rm = TRUE)),
+    RMSE_corrected = sqrt(mean((bb.doy - BB50Cor)^2, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+ 
+### Part E ####
+wdat2c <- wdat_chill |> 
+  mutate(Date = ymd(Date))
+
+portions <- subset(wdat2c, Location %in% c("Portland_NY", "Vassal"))
+
+portions <- subset(portions, Dataset %in% c("2001-2002"))
+
+start_date <- as.Date("2001-08-01")
+end_date <- as.Date("2002-07-31")
+date_sequence <- seq.Date(start_date, end_date, by = "day")
+
+# Create a data frame to map dates to consecutive day numbers
+date_mapping <- data.frame(Date = date_sequence, Day = 1:length(date_sequence))
+
+# Merge this mapping with the portions data frame
+portions <- left_join(portions, date_mapping, by = "Date")
+
+# Custom function to convert date to month initials
+date_to_month_initial <- function(date) {
+  month_initials <- c("Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul")
+  month_idx <- as.numeric(format(date, "%m")) - 7
+  if(month_idx <= 0) month_idx <- month_idx + 12
+  return(month_initials[month_idx])
+}
+
+# Apply the custom function to the breaks
+breaks <- c(1, 32, 62, 93, 123, 154, 184, 215, 246, 276, 307, 337)
+labels <- sapply(date_sequence[breaks], date_to_month_initial)
+
+
+# portions <- filter(portions, Portions > 0)
+Portions1 <- ggplot(data=portions)+
+  geom_line(aes(x=Day,y=Portions, color=Location), size=0.8, alpha=1)+
+  scale_color_manual(values = c("Portland_NY" = "#9FCFC2", "Vassal" = "#79624B"))+
+  ylab("Portions") + xlab("Month") + labs(color="Location")+
+  scale_x_continuous(limits = c(0, 365), breaks = breaks, labels = labels) +
+  # scale_x_continuous(limits=c(0,365),breaks=c(0,50,100, 150, 200, 250, 300, 350))+
+  scale_y_continuous(limits=c(0,150),breaks=c(0, 50, 100, 150))+
+  theme_bw(base_size=6) +
+  theme(legend.position = "none",
+        strip.background = element_rect(color="#CCCCCC"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x = element_line(linewidth=0.1,color="black"),
+        axis.line.y = element_line(linewidth=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(linewidth=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(angle=45,vjust=0.5, hjust=0.5),
+        axis.text.y = element_text(angle=0,vjust=0.5, hjust=0.5),
+        aspect.ratio = 1)
+
+Portions1
+
+# ggsave("Portions(-6)_v2.pdf", plot=Portions1, width=3.4, height=2.2, units =c("in"), dpi=300, path="~/Desktop/VitisPhenology_exports/")
+
+
+
+bbdat8sub=subset(subset(bbdat8, Location %in% c("Portland_NY", "Vassal")))
+
+bbdat8sub1=subset(subset(bbdat8, Location %in% c("Portland_NY")))
+bbdat8sub2=subset(subset(bbdat8, Location %in% c("Vassal")))
+
+bbdat8sub3 <- subset(bbdat8sub2, Location %in% c("Vassal") & BB50Cor < 200)
+
+bbdat8sub4 <- subset(bbdat8sub2, Location %in% c("Vassal") & BB50Cor > 200)
+bbdat8sub4$BB50Cor <- 212
+
+
+
+Pred1 <- ggplot()+
+  geom_abline(slope=1,intercept = 0, lty=1, linewidth=0.3)+
+  geom_abline(slope=1,intercept = 10, lty=3, linewidth=0.3)+
+  geom_abline(slope=1,intercept = -10, lty=3, linewidth=0.3)+
+  geom_hline(yintercept = 150, linetype="dashed", color = "darkblue", size=0.3)+
+  # geom_smooth(aes(x=bb.doy,y=BB50, color=Cultivar,fill=Cultivar),method="lm", se=F, fullrange=T)+
+  
+  geom_smooth(data=bbdat8sub1, aes(x=bb.doy,y=BB50Cor, group=Location),method="lm", se=F, fullrange=F, size=0.5, color="black")+
+  geom_point(data=bbdat8sub1,aes(x=bb.doy,y=BB50Cor, color=Location), alpha=0.6, size=0.8)+
+  
+    # geom_smooth(data=bbdat8sub2, aes(x=bb.doy,y=BB50Cor, group=Location),method="lm", se=F, fullrange=F, size=0.5, color="black")+
+  geom_point(data=bbdat8sub3,aes(x=bb.doy,y=BB50Cor, color=Location), alpha=0.6, size=0.8)+
+  
+  geom_point(data=bbdat8sub4,aes(x=bb.doy,y=BB50Cor, color=Location), alpha=0.6, size=0.8, shape=17)+
+  
+  
+  # scale_color_manual(values=pal2)+
+  # scale_fill_manual(values=pal2)+
+  scale_color_manual(values = c("Portland_NY" = "#9FCFC2", "Vassal" = "#79624B"))+
+  scale_y_continuous(limits=c(50,230), breaks=seq(50,230,20))+
+  scale_x_continuous(limits=c(50,150), breaks=seq(50,150,10))+
+  ylab("Predicted (DOY)") + xlab("Observed (DOY)") + labs(color="Cultivar", fill="Cultivar")+
+  theme_bw(base_size=6) +
+  # facet_wrap(.~Cultivar)+
+  theme(legend.position = "none",
+        strip.background = element_rect(color="#CCCCCC"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x = element_line(linewidth=0.1,color="black"),
+        axis.line.y = element_line(linewidth=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(linewidth=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(angle=45,vjust=0.5, hjust=0.5),
+        aspect.ratio = 1)
+
+Pred1
+
+# ggsave("Pred(-6)_v2.pdf", plot=Pred1, width=3.4, height=2.2, units =c("in"), dpi=300, path="~/Desktop")
+
+# 82.13421
+sqrt((sum((bbdat2b$bb.doy-(bbdat2b$BB50))^2))/length(bbdat2b$bb.doy)) #RMSE damaged
+# 82.18149
+sqrt((sum((bbdat2b$bb.doy-(bbdat2b$BB50Cor))^2))/length(bbdat2b$bb.doy)) #RMSE corrected
+
+
+bbdat8sub %>%
+  group_by(Location) %>%
+  summarise(
+    n = sum(
+      is.finite(bb.doy) &
+      is.finite(BB50) &
+      is.finite(BB50Cor)
+    ),
+    RMSE_damaged = sqrt(mean((bb.doy - BB50)^2, na.rm = TRUE)),
+    RMSE_corrected = sqrt(mean((bb.doy - BB50Cor)^2, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+
+
+
+```
+
+
+```{r Figure 5. Safety margin A}
+### Part A ####
+
+### Data for Safety margin figures, the model code needs to be previously ran to be able to make this part of the code work ###
+
+preds.portland <- subset(preds6, Location %in% "Portland_NY")
+preds.portland.all <- subset(preds.portland, Cultivar %in% c("Cabernet_Sauvignon","Riesling",  "Concord"))
+
+preds.bbyears <- preds.portland.all
+
+preds.bbyears <- preds.bbyears %>%
+    mutate(Year = as.numeric(substr(preds.bbyears$Dataset,6,9))) %>%
+    mutate(month = as.numeric(substr(preds.bbyears$Date,6,7)))
+
+safety.margins.all <- NULL
+for(i in levels(factor(preds.bbyears$Year))){
+  preds.bbyears.sub <- subset(preds.bbyears, Year %in% i)
+  #bbdat.concord.sub <- subset(bbdat.concord, Year %in% i)
+  #preds.bbyears.sub$bb.doy <- bbdat.concord.sub$bb.doy
+  safety.margins.all <- rbind(safety.margins.all, preds.bbyears.sub)
+  print(i)
+}
+
+safety.margins.all$margin <- (safety.margins.all$MinC - safety.margins.all$CH50r)
+
+breaks <- c(-Inf, 0, 2, Inf)
+labels <- c("≤ 0°C", "0°C - 2°C", "≥ 2°C")
+safety.margins.all$Safety_Margin <- cut(safety.margins.all$margin, breaks = breaks, labels = labels)
+
+
+### Switching the season to start in September and finish in June
+
+calculate_number <- function(julian_day, month, year) {
+  x_leap <- 245  # Value to subtract if it's a leap year
+  x_non_leap <- 244  # Value to subtract if it's not a leap year
+  year <- as.numeric(year)
+  is_leap <- (year %% 4 == 0) && (year %% 100 != 0 || year %% 400 == 0)
+  # Calculate the number for September 01 to December 31
+  if (month >= 9) {
+    if (is_leap) {
+      number <- julian_day - x_leap + 1
+    } else {
+      number <- julian_day - x_non_leap + 1
+    }
+  }
+  # Calculate the number for January 01 to June 30
+  else {
+    number <- julian_day + 122
+  }
+  
+  return(number)
+}
+
+safety.margins.all$number <- mapply(calculate_number, safety.margins.all$JDay, safety.margins.all$month, safety.margins.all$Year)
+
+
+#Predicted BB data
+
+pred.bbdat.all <- subset(BBpreds, Cultivar %in% c("Cabernet_Sauvignon","Riesling",  "Concord"))
+
+pred.bbdat.all <- pred.bbdat.all %>%
+  mutate(Year = as.numeric(substr(Dataset,6,9))) %>%
+  mutate(leapID = leap_year(Year)) %>% 
+  mutate(pred.bbDATE = as.Date(paste(Year, BB50Cor), format="%Y %j")) %>% 
+  # mutate(pred.bbDATE2 = as.Date(ifelse(leapID == "TRUE", pred.bbDATE+1, pred.bbDATE)))
+  mutate(pred.bbDATE2 = as.Date(ifelse(leapID == "TRUE" & BB50Cor >= 60, pred.bbDATE+1, pred.bbDATE)))
+
+pred.bbdat.all <- pred.bbdat.all %>%
+  mutate(month = month(as.Date(pred.bbDATE2, format = "%YYYY/%m/%d")))
+
+pred.bbdat.all <- pred.bbdat.all %>%
+  mutate(day = day(as.Date(pred.bbDATE2, format = "%YYYY/%m/%d")))
+
+pred.bbdat.all$number <- mapply(calculate_number, pred.bbdat.all$BB50Cor, pred.bbdat.all$month, pred.bbdat.all$Year)
+
+pred.bbdat.port <- subset(pred.bbdat.all, Location %in% "Portland_NY")
+
+
+#Density plot figure
+
+#Test accounting for field seasons staring in August and finishing in July next year.
+
+safety.margins.all <- safety.margins.all %>%
+  mutate(Year2 = as.numeric(substr(Date,1,4)))%>%
+  mutate(month2 = as.numeric(substr(Date,6,7)))
+  
+  
+# Adjusting the year based on the month for the growing season
+pred.bbdat.port <- pred.bbdat.port %>%
+  mutate(SeasonYear = if_else(month >= 8, Year + 1, Year))
+
+safety.margins.all <- safety.margins.all %>%
+  mutate(SeasonYear = if_else(month2 >= 8, Year2 + 1, Year2))
+
+# Month and Year are numeric (just making sure, as they are already!!)
+pred.bbdat.port$month <- as.numeric(pred.bbdat.port$month)
+safety.margins.all$month2 <- as.numeric(safety.margins.all$month2)
+pred.bbdat.port$Year <- as.numeric(pred.bbdat.port$Year)
+safety.margins.all$Year2 <- as.numeric(safety.margins.all$Year2)
+
+
+
+# Summarize to get one record per SeasonYear, picking the earliest budbreak
+budbreak_summary <- pred.bbdat.port %>%
+  group_by(SeasonYear) %>%
+  summarize(BudbreakDate = min(pred.bbDATE))
+
+
+budbreak_summary <- ungroup(budbreak_summary)
+
+
+# Merge the datasets
+final_data <- right_join(safety.margins.all, budbreak_summary, by = "SeasonYear")
+
+
+final_data$date.pred <- (as.Date(final_data$Date) - final_data$BudbreakDate)
+final_data$date.pred2 <- (final_data$BudbreakDate - as.Date(final_data$Date))
+
+# final_data2 <- subset(final_data, Safety_Margin %in% c("≤ 0°C","0°C - 2°C"))
+
+
+safety.margins.all2=final_data
+
+safety.margins.all3 <- subset(safety.margins.all2, Safety_Margin %in% c("≤ 0°C","0°C - 2°C"))
+
+# safety.margins.all3 <- subset(safety.margins.all2, Safety_Margin %in% c("≤ 0°C"))
+
+# safety.margins.all3 <- safety.margins.all2
+
+dat.testing <- safety.margins.all3
+
+for (i in levels(dat.testing$Location)) {
+  
+  dfName <- paste0("safety.margins_",i)
+  assign(dfName, subset(dat.testing, Location==i))
+
+} 
+
+
+custom_colors <- c("#ffa600", "#de425b", "transparent")
+
+# Adding text annotations 
+text_data <- data.frame(
+  Cultivar = c("Concord", "Riesling", "Cabernet_Sauvignon"),  
+  LabelX = c(-60, -60, -60),  # x position of each text
+  LabelY = c(0.12, 0.12, 0.12),  # y position of each text
+  Text = c("7 May ± 6.9 days", "13 May ± 6.7 days", "20 May ± 6 days") 
+)
+
+# Adjust the 'text_data' data frame similarly
+text_data$Cultivar <- factor(text_data$Cultivar, levels = c("Cabernet_Sauvignon", "Riesling", "Concord"))
+
+# , y=(after_stat(density * n/(nrow(safety.margins.all3))))
+
+      # geom_density(data=safety.margins_Bordeaux, aes(x = date.pred, y=..scaled.., fill = forcats::fct_inorder(Safety_Margin)),position="stack", alpha = 0.5)+
+
+
+      # geom_density(data=safety.margins_Portland_NY, aes(x = date.pred, y=after_stat((count/(nrow(safety.margins_Portland_NY)/(365)))/3), fill = forcats::fct_inorder(Safety_Margin)),position="stack", alpha = 0.5)+
+
+#here is the plot to do
+
+safety.margins_Portland_NY$Cultivar <- factor(safety.margins_Portland_NY$Cultivar, levels = c("Cabernet_Sauvignon", "Riesling", "Concord"))
+
+n2 <- safety.margins_Portland_NY %>%
+  distinct(Location, Cultivar, Dataset) %>% # Get unique combinations
+  nrow() # Count the rows
+n2
+
+SM <- ggplot() +
+      geom_density(data=safety.margins_Portland_NY, aes(x = date.pred, y=after_stat((count/97)), fill = forcats::fct_inorder(Safety_Margin)),position="stack", alpha = 0.5, adjust=1/1, size=0.2)+
+  scale_fill_manual(values = custom_colors) +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", size = 0.15) +
+  facet_wrap(. ~Cultivar) +
+    # geom_label(data = text_data, aes(x = LabelX, y = LabelY, label = Text),
+             # color = "black", fill = "white",
+             # fontface = "bold",
+             # label.size = 0.1,
+             # size=1.8,
+             # inherit.aes = FALSE) +
+  scale_y_continuous(limits = c(0, 0.12))+
+  scale_x_continuous(limits = c(-180, 60), breaks = c(-180, -150, -120, -90, -60, -30, 0, 30, 60))+
+  labs(x = "Days Relative to Budbreak (0 = Day of Budbreak)", y = "Density") +
+  theme_bw(base_size=6) +
+  theme(legend.position = "none",
+        # strip.background = element_rect(color="#CCCCCC"),
+        strip.background = element_blank(),
+        strip.text = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x = element_line(linewidth=0.1,color="black"),
+        axis.line.y = element_line(linewidth=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(linewidth=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(angle=45,vjust=0.5, hjust=0.5))+  
+  coord_cartesian(xlim = c(-175, 60), ylim = c(0.0055, 0.125), expand = TRUE, default = FALSE, clip = "on")
+
+
+SM
+
+# ggsave("SM_v2.pdf", plot=SM, width=4, height=2, units =c("in"), dpi=300, path="~/Desktop/Figures_phenology/")
+
+SM_percentage <- ggplot() +
+      geom_density(data=safety.margins_Portland_NY, aes(x = date.pred, y=(after_stat((count/97)*100)), fill = forcats::fct_inorder(Safety_Margin)),position="stack", alpha = 0.5, adjust=1/1, size=0.2)+
+  scale_fill_manual(values = custom_colors) +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", size = 0.15) +
+  facet_wrap(. ~Cultivar) +
+    # geom_label(data = text_data, aes(x = LabelX, y = LabelY, label = Text),
+             # color = "black", fill = "white",
+             # fontface = "bold",
+             # label.size = 0.1,
+             # size=1.8,
+             # inherit.aes = FALSE) +
+  scale_y_continuous(limits = c(0, 100))+
+  scale_x_continuous(limits = c(-180, 60), breaks = c(-180, -150, -120, -90, -60, -30, 0, 30, 60))+
+  labs(x = "Days Relative to Budbreak (0 = Day of Budbreak)", y = "Probability of Damage (%)") +
+  theme_bw(base_size=6) +
+  theme(legend.position = "none",
+        # strip.background = element_rect(color="#CCCCCC"),
+        strip.background = element_blank(),
+        strip.text = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x = element_line(linewidth=0.1,color="black"),
+        axis.line.y = element_line(linewidth=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(linewidth=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(angle=45,vjust=0.5, hjust=0.5))+  
+  coord_cartesian(xlim = c(-175, 60), ylim = c(0, 15), expand = TRUE, default = FALSE, clip = "on")
+
+
+SM_percentage
+
+
+# ggsave("SM_percentage_v1.pdf", plot=SM_percentage, width=4, height=2, units =c("in"), dpi=300, path="~/Desktop/VitisPhenology_exports/")
+
+```
+
+```{r Figure 5. Safety margin B-C}
+
+### Part B ####
+
+# Predicted BB vs Mean Temperature
+
+preds6  <- preds6  %>%
+    mutate(Year = as.numeric(substr(preds6$Dataset,6,9))) %>%
+    mutate(month = as.numeric(substr(preds6$Date,6,7)))
+
+preds6_filtered <- preds6 %>%
+  mutate(month = month(Date)) %>%  
+  filter(month %in% c(11, 12, 1, 2, 3, 4))
+
+preds6_filtered <- preds6_filtered %>%
+  mutate(MeanC = (MinC + MaxC) / 2)
+
+mean_temperature <- preds6_filtered %>%
+  group_by(Dataset, Location, Cultivar) %>%
+  summarise(Mean_T = mean(MeanC, na.rm = TRUE))  
+
+mean_temperature2 <- preds6_filtered %>%
+  group_by(Location) %>%
+  summarise(Mean_T = mean(MeanC, na.rm = TRUE))  
+
+
+merged_data_2 <- BBpreds %>%
+  left_join(mean_temperature, by = c("Dataset", "Cultivar", "Location"))
+
+
+Freeze.risk.test <- preds6 
+
+Freeze.risk.test$margin <- (Freeze.risk.test$MinC - Freeze.risk.test$CH50r)
+Freeze.risk.test$Year=as.numeric(substr(Freeze.risk.test$Dataset,6,9))
+# Freeze.risk.test$mean_temperature <- ((Freeze.risk.test$MinC + Freeze.risk.test$MaxC)/2)
+                                      
+
+Freeze.risk.test.7 <- Freeze.risk.test %>%
+  dplyr::select(Cultivar, Location, margin, Dataset,Year, JDay, MinC, MaxC, CH50r)
+
+days_per_year4 <- Freeze.risk.test %>%
+  mutate(negative_margin = ifelse(margin < 0, 1, 0)) %>%
+  dplyr::select(Cultivar, Location, margin, Dataset, Year, JDay, MinC, CH50r,negative_margin) %>%
+  group_by(Dataset, Cultivar, Location, Year) %>%
+  summarise(
+    FreezeRisk = sum(negative_margin, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+
+days_per_year4 <- days_per_year4 %>%
+  left_join(mean_temperature, by = c("Dataset", "Cultivar", "Location"))
+
+days_per_year4$Cultivar <- factor(days_per_year4$Cultivar, levels = c("Cabernet_Sauvignon", "Riesling", "Concord"))
+
+days_per_year4$log_FreezeRisk <- log(days_per_year4$FreezeRisk + 1)
+
+
+n <- Freeze.risk.test %>%
+  distinct(Location, Cultivar, Dataset) %>% # Get unique combinations
+  nrow() # Count the rows
+n
+
+days_per_year5=days_per_year4
+
+days_per_year5$Mean_T=round(days_per_year5$Mean_T,digits=1)
+
+
+pal2=c( "#C32966", "#3B8441","#234F9C", "black")
+
+
+Freeze_risk_cultivar <- ggplot()+
+    geom_count(data=days_per_year5, aes(x=Mean_T,y=(log_FreezeRisk), size=after_stat(prop), group=Mean_T, alpha=after_stat(prop), color=Cultivar))+
+    geom_smooth(data=days_per_year4, aes(x=Mean_T,y=log_FreezeRisk, , alpha=1), color="black", linetype="solid", se=F, method="loess", span=0.4)+
+  # geom_point(data=days_per_year4, aes(x=Mean_T,y=(FreezeRisk), alpha=1, color=Cultivar), size=1)+
+    # geom_smooth(data=days_per_year4, aes(x=Mean_T,y=FreezeRisk, , alpha=1), color="black", linetype="solid", se=F, method="loess", span=0.5)+
+    # scale_y_continuous(limits = c(0, 5), breaks = c(0, 0.69, 1.09, 1.38, 1.791759, 2.079442, 2.397895,2.833213), labels = c("0", "1", "2", "3","4","6","10","16")) +
+    scale_y_continuous(limits = c(0, 3), breaks = log(1+c(0,1,3,6,10,15)), labels = c("0", "1", "3","6","10","15")) +
+  scale_color_manual(values=pal2)+
+  scale_size_area(max_size = 3) + # Control maximum point size
+  scale_alpha_continuous(range = c(0.1, 0.6))+
+   facet_wrap(.~Cultivar)+
+  # facet_wrap(.~Location)+
+  # facet_wrap(~Location+Cultivar, scales = "free_y")+
+  labs(x = "Mean Dormant Season Temperature (°C)", y = "Days wih Freeze Damage Risk") +
+  theme_bw(base_size=6) +
+  theme(legend.position = "none",
+        # strip.background = element_rect(color="#CCCCCC"),
+        strip.background = element_blank(),
+        strip.text = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        plot.background = element_blank(),
+        panel.background = element_blank(),    
+        axis.line.x = element_line(linewidth=0.1,color="black"),
+        axis.line.y = element_line(linewidth=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(linewidth=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(angle=45,vjust=0.5, hjust=0.5))
+
+Freeze_risk_cultivar
+
+
+# ggsave("Freeze_risk_cultivar_v1.pdf", plot=Freeze_risk_cultivar, width=4, height=2, units =c("in"), dpi=300, path="~/Desktop/VitisPhenology_exports/")
+
+
+
+
+### Part C ####
+
+pal4=c("#898989","#898989","#898989")
+
+
+# days_per_year5=days_per_year4
+# 
+# days_per_year5$Mean_T=round(days_per_year5$Mean_T,digits=1)
+
+Freeze_risk_all <- ggplot()+
+    geom_count(data=days_per_year5, aes(x=Mean_T,y=(log_FreezeRisk), size=after_stat(prop), group=Mean_T, alpha=after_stat(prop)))+
+    geom_smooth(data=days_per_year4, aes(x=Mean_T,y=log_FreezeRisk, , alpha=1), color="black", linetype="solid", se=F, method="loess", span=0.4)+
+  # geom_point(data=days_per_year4, aes(x=Mean_T,y=(FreezeRisk), alpha=1, color=Cultivar), size=1)+
+    # geom_smooth(data=days_per_year4, aes(x=Mean_T,y=FreezeRisk, , alpha=1), color="black", linetype="solid", se=F, method="loess", span=0.5)+
+    # scale_y_continuous(limits = c(0, 5), breaks = c(0, 0.69, 1.09, 1.38, 1.791759, 2.079442, 2.397895,2.833213), labels = c("0", "1", "2", "3","4","6","10","16")) +
+    scale_y_continuous(limits = c(0, 5), breaks = log(1+c(0,1,3,6,10,15)), labels = c("0", "1", "3","6","10","15")) +
+  scale_color_manual(values=pal4)+
+  scale_size_area(max_size = 3) + # Control maximum point size
+  scale_alpha_continuous(range = c(0.1, 0.6))+
+   # facet_wrap(.~Cultivar)+
+  # facet_wrap(.~Location)+
+  # facet_wrap(~Location+Cultivar, scales = "free_y")+
+  labs(x = "Mean Dormant Season Temperature (°C)", y = "Days wih Freeze Damage Risk") +
+  theme_bw(base_size=6) +
+  theme(legend.position = "right",
+        # strip.background = element_rect(color="#CCCCCC"),
+        strip.background = element_blank(),
+        strip.text = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        plot.background = element_blank(),
+        panel.background = element_blank(),    
+        axis.line.x = element_line(linewidth=0.1,color="black"),
+        axis.line.y = element_line(linewidth=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(linewidth=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(angle=45,vjust=0.5, hjust=0.5))
+
+Freeze_risk_all
+
+# ggsave("Freeze_risk_all_v1.png", plot=Freeze_risk_all, width=3, height=2.5, bg="transparent", units =c("in"), dpi=800, path="~/Desktop/VitisPhenology_exports/")
+
+
+
+# days_per_year4$Location <- factor(days_per_year4$Location, levels = c("Ontario", "Portland_NY", "Lewisberg_PA","Lower_Franconia", "Colmar", "MB", "Bordeaux", "Vassal"))
+
+days_per_year4$Location <- factor(days_per_year4$Location, levels = c("Vassal","Bordeaux","MB","Colmar","Lower_Franconia", "Lewisberg_PA","Portland_NY","Ontario" ))
+
+
+Location_mean_T <- ggplot()+
+      geom_line(data=days_per_year4, aes(x=Mean_T, y=Location, color=Location), size=0.8)+
+    scale_color_manual(values=c("#AA9E8A","#9FCFC2","#8891AE", "#7EB7CF","#DBA288", "#5E9C89","#C65F48","#79624B"),
+                     breaks = c("Ontario","Portland_NY","Lewisberg_PA", "Lower_Franconia","Colmar", "MB","Bordeaux","Vassal"),
+                     labels = c("Niagara-on-the-Lake, ON, CA","Portland, NY, US", "Lewisburg, PA, US","Vietschöchheim, DE", "Bergheim, FR", "Montreuil-Bellay-FR", "Bordeaux, FR",  "Marseillan-Plage, FR")) +
+# scale_y_discrete(breaks = c("Vassal", "Bordeaux", "MB", "Colmar", "Lower_Franconia", "Lewisberg_PA", "Portland_NY", "Ontario"), 
+#                  labels = c("Marseillan-Plage, FR", "Bordeaux, FR", "Montreuil-Bellay-FR", "Bergheim, FR", "Vietschöchheim, DE", "Lewisburg, PA, US", "Portland, NY, US", "Niagara-on-the-Lake, ON, CA")) + 
+  theme_bw(base_size=6) +
+  theme(legend.position = "none",
+        # strip.background = element_rect(color="#CCCCCC"),
+        strip.background = element_blank(),
+        strip.text = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        plot.background = element_blank(),
+        panel.background = element_blank(),    
+        axis.line.x = element_line(linewidth=0.1,color="black"),
+        axis.line.y = element_line(linewidth=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(linewidth=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.y = element_blank(),
+        axis.text.x = element_text(angle=45,vjust=0.5, hjust=0.5))
+
+Location_mean_T
+
+# ggsave("Location_mean_T_v2.png", plot=Location_mean_T, width=2.31, height=1.2, bg="transparent", units =c("in"), dpi=300, path="~/Desktop/VitisPhenology_exports/")
+
+
+
+
+
+```
+
+```{r Figure 6 Sensitivity}
+
+
+merged_data_2 <- BBpreds %>%
+  left_join(mean_temperature, by = c("Dataset", "Cultivar", "Location")) %>%
+  dplyr::filter(BB50Fin <= 180)
+
+### Part A ####
+
+model <- lm(BB50Fin ~ Mean_T, data = merged_data_2)
+
+summary(model)
+
+# based on the model every C increase in temperature, BB decreases (advanced BB) by approximately 5.75 days 
+
+summary(lm(BB50Fin~Mean_T, data=subset(merged_data_2, Mean_T>-0.9 & Mean_T<3)))
+# summary(lm(BB50Fin~Mean_T, data=subset(merged_data_2, Mean_T>3.01 & Mean_T<9)))
+summary(lm(BB50Fin~Mean_T, data=subset(merged_data_2, Mean_T>3.01 & Mean_T<10)))
+summary(lm(BB50Fin~Mean_T, data=subset(merged_data_2, Mean_T>=10.01 & Mean_T<=12)))
+
+
+filtered_data_1 <- merged_data_2 %>% filter(Mean_T < 3)
+filtered_data_2 <- merged_data_2 %>% filter(Mean_T >= 3.01 & Mean_T <= 9)
+filtered_data_3 <- merged_data_2 %>% filter(Mean_T >= 3.01 & Mean_T <= 10)
+# filtered_data_4 <- merged_data_2 %>% filter(Mean_T >= 8.9 & Mean_T <= 10)
+filtered_data_5 <- merged_data_2 %>% filter(Mean_T>=10.01 & Mean_T<=13)
+
+
+
+
+pal2=c("#C32966","#234F9C", "#3B8441", "black")
+
+
+Sensitivity1 <- ggplot() +
+  geom_point(data = merged_data_2, aes(x = Mean_T, y = BB50Fin, color = Cultivar), size = 0.7, alpha=0.6) +
+  geom_smooth(data = merged_data_2, aes(x = Mean_T, y = BB50Fin), se = F, color = "white", size=1.2, method="lm") +
+  geom_smooth(data = merged_data_2, aes(x = Mean_T, y = BB50Fin), se = TRUE, color = "black", fullrange = F, size=0.8, method="lm") +
+        geom_smooth(data = filtered_data_1, aes(x = Mean_T, y = BB50Fin), se = F, color = "white", size=1.2, method="lm") +
+  geom_smooth(data = filtered_data_1, aes(x = Mean_T, y = BB50Fin), se = F, color = "#2C525D", size=0.8, method="lm") +
+  # geom_smooth(data = filtered_data_2, aes(x = Mean_T, y = BB50Fin), se = TRUE, color = "#92843C", size=0.6, method="lm") +
+        geom_smooth(data = filtered_data_5, aes(x = Mean_T, y = BB50Fin), se = F, color = "white", size=1.2, method="lm") +
+  geom_smooth(data = filtered_data_5, aes(x = Mean_T, y = BB50Fin), se = F, color = "#EBB7BA", size=0.8, method="lm") +
+      geom_smooth(data = filtered_data_3, aes(x = Mean_T, y = BB50Fin), se = F, color = "white", size=1.2, method="lm") +
+  geom_smooth(data = filtered_data_3, aes(x = Mean_T, y = BB50Fin), se = F, color = "#92843C", size=0.8, method="lm") +
+    # geom_smooth(data = filtered_data_4, aes(x = Mean_T, y = BB50Fin), se = TRUE, color = "red", size=0.6, method="lm") +
+  geom_segment(aes(x = -1.12, y = 38, xend = 3, yend = 38), color = "#2C525D", size = 1.5) +  # Line from 0 to 3
+  geom_segment(aes(x = 3, y = 38, xend = 10, yend = 38), color = "#92843C", size = 1.5) +  # Line from 3 to 9
+  geom_segment(aes(x = 10, y =38, xend = 12.05, yend = 38), color = "#EBB7BA", size = 1.5) +  # Line from 9 to 13
+    geom_segment(aes(x = -1.1, y = 40, xend = -1.1, yend = 145), linetype = "dashed", color = "darkblue", size = 0.2) +
+      geom_segment(aes(x = 3, y = 40, xend = 3, yend = 128.5), linetype = "dashed", color = "darkblue", size = 0.2) +
+        geom_segment(aes(x = 10, y = 40, xend = 10, yend = 88), linetype = "dashed", color = "darkblue", size = 0.2) +
+          geom_segment(aes(x = 12, y = 40, xend = 12, yend = 85), linetype = "dashed", color = "darkblue", size = 0.2) +
+  scale_y_continuous(limits=c(38,160), breaks=seq(40,160,20))+
+  scale_x_continuous(limits=c(-1.2,12.2), breaks=seq(-1,12,1))+
+  # scale_x_continuous(breaks = c(-1,1, 3,5,7,9,10, 11,12)) +
+  # scale_x_continuous(breaks=seq(-1,12,1))+
+  scale_color_manual(values=pal2) +
+  labs(x = "Mean Dormant Season Temperature (°C)",
+       y = "Predicted budbreak (DOY)") +
+  theme_bw(base_size=6) +
+  theme(legend.position = "none",
+        strip.background = element_rect(color="#CCCCCC"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x = element_line(linewidth=0.1,color="black"),
+        axis.line.y = element_line(linewidth=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(linewidth=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(angle=0,vjust=0.5, hjust=0.5),
+        aspect.ratio = 1)
+
+Sensitivity1
+
+# ggsave("Sensitivity1_v1.pdf", plot=Sensitivity1 , width=3, height=2.5, units =c("in"), dpi=300, path="~/Desktop/VitisPhenology_exports/")
+
+
+### Part B ####
+
+# Just Portland_NY and Vassal
+
+
+merged_data_p_v <- subset(merged_data_2, Location %in% c("Portland_NY", "Vassal"))
+
+filtered_data_6 <- merged_data_p_v %>% filter(Mean_T < 5)
+filtered_data_7 <- merged_data_p_v %>% filter(Mean_T >= 8 & Mean_T <= 10)
+filtered_data_8 <- merged_data_p_v %>% filter(Mean_T >= 10.01 & Mean_T <= 12)
+
+
+Sensitivity3 <- ggplot() +
+    # geom_smooth(data=merged_data, aes(x = Mean_T, y = BB50Cor, color=Cultivar),method = "lm", se = F, fullrange=F, linetype = "solid") +
+  geom_point(data=merged_data_p_v, aes(x = Mean_T, y = BB50Fin, color=Location), size=0.7, alpha=0.6) +
+  
+        geom_smooth(data=merged_data_p_v, aes(x = Mean_T, y = BB50Fin+2, group=Location), se = F, color = "white", fullrange=F, linetype = "solid", method="lm", size=1.2) +
+  
+      geom_smooth(data=merged_data_p_v, aes(x = Mean_T, y = BB50Fin+2, group=Location), se = F, color = "black", fullrange=F, linetype = "solid", method="lm", size=0.8) +
+  
+    geom_smooth(data=filtered_data_6, aes(x = Mean_T, y = BB50Fin, group=Location), se = F, color = "white", fullrange=F, linetype = "solid", method="lm", size=1.2) +
+    geom_smooth(data=filtered_data_6, aes(x = Mean_T, y = BB50Fin, group=Location), se = F, color = "#2C525D", fullrange=F, linetype = "solid", method="lm", size=0.8) +
+  
+    geom_smooth(data=filtered_data_7, aes(x = Mean_T, y = BB50Fin, group=Location), se = F, color = "white", fullrange=F, linetype = "solid", method="lm", size=1.2) +
+    geom_smooth(data=filtered_data_7, aes(x = Mean_T, y = BB50Fin, group=Location), se = F, color = "#92843C", fullrange=F, linetype = "solid", method="lm", size=0.8) +
+  
+      geom_smooth(data=filtered_data_8, aes(x = Mean_T, y = BB50Fin, group=Location), se = F, color = "white", fullrange=F, linetype = "solid", method="lm", size=1.2) +
+    geom_smooth(data=filtered_data_8, aes(x = Mean_T, y = BB50Fin, group=Location), se = F, color = "#EBB7BA", fullrange=F, linetype = "solid", method="lm", size=0.8) +
+  
+   geom_segment(aes(x = -1, y = 38, xend = 5, yend = 38), color = "#2C525D", size = 1.5) +  # Line from 0 to 3
+  geom_segment(aes(x = 8.07, y = 38, xend = 10, yend = 38), color = "#92843C", size = 1.5) +  # Line from 3 to 9
+  geom_segment(aes(x = 10, y =38, xend = 12.05, yend = 38), color = "#EBB7BA", size = 1.5) +  # Line from 9 to 13
+    geom_segment(aes(x = -0.99, y = 40, xend = -0.99, yend = 143), linetype = "dashed", color = "darkblue", size = 0.15) +
+      geom_segment(aes(x = 4.98, y = 40, xend = 4.98, yend = 126), linetype = "dashed", color = "darkblue", size = 0.15) +
+        geom_segment(aes(x = 8.1, y = 40, xend = 8.1, yend = 100), linetype = "dashed", color = "darkblue", size = 0.15) +
+          geom_segment(aes(x = 10, y = 40, xend = 10, yend = 86), linetype = "dashed", color = "darkblue", size = 0.15) +
+            geom_segment(aes(x = 12.02, y = 40, xend = 12.02, yend = 90), linetype = "dashed", color = "darkblue", size = 0.15) +
+  
+  labs(x = "Mean Dormant Season Temperature (°C)",
+       y = "Predicted budbreak (DOY)") +
+  scale_y_continuous(limits=c(38,160), breaks=seq(40,160,20))+
+  scale_x_continuous(limits=c(-1.2,12.2), breaks=seq(-1,12,1))+
+  # scale_x_continuous(breaks = c(-1, 1, 3, 6, 9, 12)) +
+  scale_color_manual(values=c("#9FCFC2","#79624B") ,labels=c("Portland, NY, USA","Vassal, France"))+
+  scale_fill_manual(values=c("#9FCFC2","#79624B") ,labels=c("Portland, NY, USA","Vassal, France"))+
+  theme_bw(base_size=6) +
+  theme(legend.position = "none",
+        strip.background = element_rect(color="#CCCCCC"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x = element_line(linewidth=0.1,color="black"),
+        axis.line.y = element_line(linewidth=0.1,color="black"),
+        axis.text = element_text(size=6, color="black"),
+        axis.ticks = element_line(linewidth=0.1,color="black"),
+        axis.ticks.length = unit(0.2, 'lines'),
+        axis.text.x = element_text(angle=0,vjust=0.5, hjust=0.5))
+
+Sensitivity3
+
+
+# ggsave("Sensitivity_per_region_v1.pdf", plot=Sensitivity3 , width=2.5, height=2, units =c("in"), dpi=300, path="~/Desktop/VitisPhenology_exports/")
+
+filtered_data_6 <- merged_data_p_v %>% filter(Mean_T < 5)
+filtered_data_7 <- merged_data_p_v %>% filter(Mean_T >= 8 & Mean_T <= 10)
+filtered_data_8 <- merged_data_p_v %>% filter(Mean_T >= 10.01 & Mean_T <= 12)
+
+
+model <- lm(BB50Fin ~ Mean_T, data = merged_data_p_v)
+
+
+summary(lm(BB50Fin~Mean_T, data=subset(merged_data_p_v, Mean_T < 5)))
+summary(lm(BB50Fin~Mean_T, data=subset(merged_data_p_v, Mean_T >= 8 & Mean_T <= 10)))
+summary(lm(BB50Fin~Mean_T, data=subset(merged_data_p_v, Mean_T >= 10.01 & Mean_T <= 12)))
+
+
+#Cultivar sensitivity 
+
+#Concord 
+merged_data_Concord <- subset(merged_data_2, Cultivar %in% c("Concord"))
+
+model_Concord <- lm(BB50Fin ~ Mean_T, data = merged_data_Concord)
+
+summary(model_Concord)
+
+#CS
+merged_data_CS <- subset(merged_data_2, Cultivar %in% c("Cabernet_Sauvignon"))
+
+model_CS <- lm(BB50Fin ~ Mean_T, data = merged_data_CS)
+
+summary(model_CS)
+
+#Riesling
+merged_data_Ri <- subset(merged_data_2, Cultivar %in% c("Riesling"))
+
+model_Ri <- lm(BB50Fin ~ Mean_T, data = merged_data_Ri)
+
+summary(model_Ri)
+
+
+```
+
